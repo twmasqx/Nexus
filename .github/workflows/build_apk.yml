@@ -3,14 +3,14 @@ name: Build Nexus Vision APK
 on:
   push:
     branches: [main, master]
-  workflow_dispatch:          # allow manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04     # 22.04 required for libtinfo5 compatibility
+    runs-on: ubuntu-22.04
 
     steps:
-      # ── 1. Checkout ─────────────────────────────────────────────
+      # ── 1. Checkout ──────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -25,13 +25,13 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
-            git zip unzip \
+            git zip unzip wget \
             openjdk-17-jdk \
             autoconf automake libtool pkg-config \
             zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
             cmake libffi-dev libssl-dev \
             python3-dev build-essential \
-            libltdl-dev
+            libltdl-dev ccache
 
       # ── 4. Python packages ───────────────────────────────────────────────
       - name: Install Python build tools
@@ -40,27 +40,63 @@ jobs:
           pip install "Cython<3.0"
           pip install buildozer
 
-      # ── 5. Cache buildozer downloads (~1 GB) ─────────────────────────────
-      - name: Cache buildozer global directory
+      # ── 5. Cache buildozer (~1 GB) ────────────────────────────────────────
+      - name: Cache buildozer directory
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
+          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}-v2
           restore-keys: |
             ${{ runner.os }}-buildozer-
 
-      # ── 6. Build ─────────────────────────────────────────────────────────
+      # ── 6. Accept Android SDK licenses manually ──────────────────────────
+      - name: Pre-accept Android SDK licenses
+        run: |
+          mkdir -p ~/.android
+          touch ~/.android/repositories.cfg
+          # Accept all licenses without interactive prompt
+          yes | buildozer android p4a -- --help > /dev/null 2>&1 || true
+
+      # ── 7. Build (full output, no pipe truncation) ───────────────────────
       - name: Build debug APK
         env:
           APP_ANDROID_ACCEPT_SDK_LICENSE: "1"
+          ANDROID_SDK_ROOT: /root/.buildozer/android/platform/android-sdk
         run: |
-          yes | buildozer -v android debug 2>&1 | tail -200
+          # pipefail ensures buildozer exit code propagates
+          set -o pipefail
+          yes | buildozer -v android debug 2>&1 | tee build.log
+          echo "Build exit code: $?"
 
-      # ── 7. Upload artifact ───────────────────────────────────────────────
-      - name: Upload APK
+      # ── 8. Show last 100 lines of log on failure ─────────────────────────
+      - name: Show build log tail (on failure)
+        if: failure()
+        run: |
+          echo "=== LAST 100 LINES OF BUILD LOG ==="
+          tail -100 build.log || echo "No log file found"
+          echo ""
+          echo "=== SEARCHING FOR APK FILES ==="
+          find . -name "*.apk" 2>/dev/null || echo "No APK found"
+          echo ""
+          echo "=== BIN DIRECTORY CONTENTS ==="
+          ls -la bin/ 2>/dev/null || echo "bin/ does not exist"
+
+      # ── 9. Upload APK ────────────────────────────────────────────────────
+      - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: nexus-vision-debug-apk
           path: bin/*.apk
           if-no-files-found: error
           retention-days: 30
+
+      # ── 10. Upload build log (always, for debugging) ─────────────────────
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
