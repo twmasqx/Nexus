@@ -12,9 +12,10 @@ source.include_exts   = py,png,jpg,kv,atlas,json,wav
 source.exclude_dirs   = __pycache__,.buildozer,.git,tests
 
 # ── Requirements ──────────────────────────────────────────────────────────────
-# CRITICAL: python3==3.10 — Python 3.14 breaks Kivy config.pxi / Cython build
-# hostpython3==3.10 — match host toolchain to target
-requirements = python3==3.10,hostpython3==3.10,kivy==2.3.0,plyer,Cython>=0.29.33,<3.0
+# p4a master (2024.01.21) defaults to Python 3.11.6 — works with Kivy 2.3.0
+# DO NOT pin python3 version here (p4a URL format only accepts full x.y.z)
+# Cython is pre-installed by pip in the workflow — NOT listed here
+requirements = python3,kivy==2.3.0,plyer
 
 # ── Display ───────────────────────────────────────────────────────────────────
 orientation  = portrait
