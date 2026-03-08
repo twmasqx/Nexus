@@ -323,26 +323,42 @@ class AlertSystem:
         self._setup_sound()
 
     def _setup_sound(self):
-        import struct, wave, math, tempfile
-        path = os.path.join(tempfile.gettempdir(), "nexus_alert.wav")
+        import struct, wave, math
+        # Use internal app storage on Android (no permissions needed), temp dir elsewhere
+        if ANDROID:
+            cache_dir = os.environ.get('ANDROID_PRIVATE',
+                                       '/data/data/org.nexus.vision/files')
+        else:
+            import tempfile
+            cache_dir = tempfile.gettempdir()
+        self._wav_path = os.path.join(cache_dir, "nexus_alert.wav")
         try:
             sr, dur = 44100, 0.28
             n = int(sr * dur)
-            with wave.open(path, "wb") as w:
+            with wave.open(self._wav_path, "wb") as w:
                 w.setnchannels(1)
                 w.setsampwidth(2)
                 w.setframerate(sr)
                 for i in range(n):
                     t    = i / sr
                     fade = min(min(i, n - i) / (sr * 0.022), 1.0)
-                    # dual-tone: 880 Hz + 1320 Hz (perfect fifth)
                     v = int(28000 * fade * (
                         0.55 * math.sin(2 * math.pi * 880  * t) +
                         0.45 * math.sin(2 * math.pi * 1320 * t)
                     ))
                     w.writeframes(struct.pack("<h", v))
+        except Exception:
+            self._wav_path = None
+
+        # Defer sound loading until Kivy audio engine is ready (0.5 s after init)
+        Clock.schedule_once(self._load_sound, 0.5)
+
+    def _load_sound(self, dt=None):
+        if not self._wav_path:
+            return
+        try:
             from kivy.core.audio import SoundLoader
-            self._sound = SoundLoader.load(path)
+            self._sound = SoundLoader.load(self._wav_path)
             if self._sound:
                 self._sound.volume = 0.9
         except Exception:
@@ -551,15 +567,36 @@ class SpeedTest:
 # ─── Database ────────────────────────────────────────────────────────────────
 class Database:
     def __init__(self):
+        base = None
         if ANDROID:
-            try:
-                from android.storage import app_storage_path  # type: ignore
-                base = Path(app_storage_path())
-            except Exception:
-                base = Path('/sdcard/nexus_vision')
+            # Priority 1: p4a internal private storage (never needs permissions)
+            priv = os.environ.get('ANDROID_PRIVATE', '')
+            if priv:
+                base = Path(priv)
+            else:
+                # Priority 2: android.storage API
+                try:
+                    from android.storage import app_storage_path  # type: ignore
+                    base = Path(app_storage_path())
+                except Exception:
+                    pass
+            if base is None:
+                base = Path('/data/data/org.nexus.vision/files')
         else:
             base = Path(os.path.expanduser("~")) / ".nexus_vision"
-        base.mkdir(parents=True, exist_ok=True)
+
+        # Always wrap mkdir — permission errors must not crash the app
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            # Last-resort fallback: system temp dir
+            import tempfile
+            base = Path(tempfile.gettempdir()) / "nexus_vision"
+            try:
+                base.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
         self.path = base / "db.json"
         self._d = {
             "devices":  {},
@@ -1035,18 +1072,17 @@ class Scanner:
                 return "Root required"
         except Exception as e:
             return f"Error: {e}"
+        # Android: check WifiConfigStore.xml (requires root)
         if ANDROID:
             try:
                 cfg = "/data/misc/wifi/WifiConfigStore.xml"
                 content = open(cfg).read()
-                import re as _re
-                pattern = rf'PreSharedKey.*?value="(.*?)"'
-                m = _re.search(pattern, content)
+                m = re.search(r'PreSharedKey.*?value="(.*?)"', content)
                 if m:
                     return m.group(1)
-                return "Root required"
             except Exception:
-                return "Root required"
+                pass
+            return "Root required"
         return "Not supported"
 
     @staticmethod
@@ -1697,9 +1733,9 @@ class RadarWidget(Widget):
 
 
 # ─── Shared UI helpers ────────────────────────────────────────────────────────
-def _lbl(text, size=11, color=G2, bold=False, halign='left'):
-    lb = Label(text=text, font_size=sp(size), color=color,
-               bold=bold, halign=halign, valign='middle')
+def _lbl(text, size=11, color=G2, bold=False, halign='left', **kwargs):
+    lb = Label(text=str(text), font_size=sp(size), color=color,
+               bold=bold, halign=halign, valign='middle', **kwargs)
     lb.bind(size=lb.setter('text_size'))
     return lb
 
@@ -2498,6 +2534,21 @@ class SettingsScreen(BaseScreen):
     def _build(self):
         inner = self._inner
 
+        # ── MIUI / Redmi / Xiaomi battery optimization notice ──────────
+        if ANDROID:
+            note_row = BoxLayout(size_hint_y=None, height=dp(52),
+                                 padding=[dp(10), dp(4)])
+            with note_row.canvas.before:
+                Color(0.5, 0.3, 0.0, 0.45)
+                nb = Rectangle(pos=note_row.pos, size=note_row.size)
+                note_row.bind(pos=lambda w, v: setattr(nb, 'pos', v),
+                              size=lambda w, v: setattr(nb, 'size', v))
+            note_row.add_widget(_lbl(
+                "MIUI / Redmi: Go to  Settings > Battery > App Battery Saver\n"
+                "and set Nexus Vision to  'No restrictions'  for best performance.",
+                size=8, color=YEL, halign='center'))
+            inner.add_widget(note_row)
+
         # ── Scan settings ─────────────────────────────────────────────
         inner.add_widget(self._section("SCAN SETTINGS"))
         inner.add_widget(self._interval_row())
@@ -2550,26 +2601,56 @@ class SettingsScreen(BaseScreen):
         # ── My Network ────────────────────────────────────────────────
         inner.add_widget(self._section("MY NETWORK"))
         self._net_rows = {}   # key → label widget (for async update)
+        # ALL values loaded in background to avoid blocking main thread
         net_keys = [
-            ("SSID",          "Loading…", G1),
-            ("Password",      "Loading…", YEL),
-            ("Your IP",       Scanner.my_ip(), CYN),
-            ("Gateway (Router)", Scanner.gateway_ip(), CYN),
-            ("ISP",           "Loading…", G2),
+            ("SSID",             "Loading…", G1),
+            ("Password",         "Loading…", YEL),
+            ("Your IP",          "Loading…", CYN),
+            ("Gateway (Router)", "Loading…", CYN),
+            ("ISP",              "Loading…", G2),
         ]
         for key, val, col in net_keys:
             r = BoxLayout(orientation='horizontal', size_hint_y=None,
                           height=dp(38), padding=[dp(10), dp(4)], spacing=dp(6))
             _card(r)
-            r.add_widget(_lbl(key, size=10, color=G2,
-                              size_hint_x=None, width=dp(130)))
-            lbl_val = _lbl(val, size=10, color=col,
-                           bold=True, halign='right')
+            key_lbl = _lbl(key, size=10, color=G2)
+            key_lbl.size_hint_x = None
+            key_lbl.width = dp(130)
+            r.add_widget(key_lbl)
+            lbl_val = _lbl(val, size=10, color=col, bold=True, halign='right')
             r.add_widget(lbl_val)
             self._net_rows[key] = lbl_val
             inner.add_widget(r)
 
-        # async load slow values (password, ISP)
+        # ── Feature Status (root / permission required) ────────────────
+        inner.add_widget(self._section("FEATURE STATUS"))
+        feat_items = [
+            ("Device Detection (ARP)",    True,  "No root needed"),
+            ("Network Traffic Analysis",  True,  "OWN device only"),
+            ("WiFi SSID / IP Info",       True,  "Location perm needed"),
+            ("WiFi Password (Android)",   False, "Root required"),
+            ("Block Device (Kick)",       False, "Root required"),
+            ("Speed Throttle",            False, "Root required"),
+            ("Bluetooth Scan",            True,  "BLUETOOTH perm needed"),
+        ]
+        for feat, available, note in feat_items:
+            row = BoxLayout(orientation='horizontal', size_hint_y=None,
+                            height=dp(36), padding=[dp(10), dp(2)])
+            _card(row)
+            icon_col = G1 if available else RED
+            icon_txt = "[OK]" if available else "[!!]"
+            icon_lbl = _lbl(icon_txt, size=10, color=icon_col, bold=True)
+            icon_lbl.size_hint_x = None
+            icon_lbl.width = dp(40)
+            feat_lbl = _lbl(feat, size=9, color=WHT)
+            feat_lbl.size_hint_x = 0.55
+            note_lbl = _lbl(note, size=8, color=G3, halign='right')
+            row.add_widget(icon_lbl)
+            row.add_widget(feat_lbl)
+            row.add_widget(note_lbl)
+            inner.add_widget(row)
+
+        # async load ALL network values in background
         threading.Thread(target=self._load_net_info, daemon=True).start()
 
         # ── App info ──────────────────────────────────────────────────
@@ -2592,18 +2673,42 @@ class SettingsScreen(BaseScreen):
         inner.add_widget(Widget(size_hint_y=None, height=dp(20)))
 
     def _load_net_info(self):
-        """Runs in background thread, updates MY NETWORK labels."""
-        ssid = Scanner.wifi_ssid()
-        pw   = Scanner.wifi_password(ssid)
-        isp  = Scanner.isp_info()
+        """Runs in background thread, updates ALL MY NETWORK labels."""
+        try:
+            ssid = Scanner.wifi_ssid()
+        except Exception:
+            ssid = "Unknown"
+        try:
+            pw = Scanner.wifi_password(ssid)
+        except Exception:
+            pw = "Root required"
+        try:
+            isp = Scanner.isp_info()
+        except Exception:
+            isp = "Unknown"
+        try:
+            my_ip = Scanner.my_ip()
+        except Exception:
+            my_ip = "Unknown"
+        try:
+            gw = Scanner.gateway_ip()
+        except Exception:
+            gw = "Unknown"
 
         def _update(dt):
-            if "SSID" in self._net_rows:
-                self._net_rows["SSID"].text = ssid
-            if "Password" in self._net_rows:
-                self._net_rows["Password"].text = pw
-            if "ISP" in self._net_rows:
-                self._net_rows["ISP"].text = isp
+            try:
+                if "SSID" in self._net_rows:
+                    self._net_rows["SSID"].text = ssid or "Unknown"
+                if "Password" in self._net_rows:
+                    self._net_rows["Password"].text = pw or "Root required"
+                if "Your IP" in self._net_rows:
+                    self._net_rows["Your IP"].text = my_ip
+                if "Gateway (Router)" in self._net_rows:
+                    self._net_rows["Gateway (Router)"].text = gw
+                if "ISP" in self._net_rows:
+                    self._net_rows["ISP"].text = isp or "Unknown"
+            except Exception:
+                pass
 
         Clock.schedule_once(_update, 0)
 
@@ -2744,9 +2849,37 @@ class NavBar(BoxLayout):
 
 
 # ─── App ─────────────────────────────────────────────────────────────────────
+def _request_android_permissions():
+    """
+    Request runtime permissions on Android 6+.
+    Called once at startup.  Silent on all other platforms.
+    """
+    if not ANDROID:
+        return
+    try:
+        from android.permissions import request_permissions, Permission  # type: ignore
+        request_permissions([
+            Permission.ACCESS_FINE_LOCATION,
+            Permission.ACCESS_COARSE_LOCATION,
+            Permission.ACCESS_WIFI_STATE,
+            Permission.CHANGE_WIFI_STATE,
+            Permission.ACCESS_NETWORK_STATE,
+            Permission.BLUETOOTH,
+            Permission.BLUETOOTH_ADMIN,
+            Permission.VIBRATE,
+            Permission.READ_PHONE_STATE,
+        ])
+    except Exception:
+        pass
+
+
 class NexusVisionApp(App):
     def build(self):
         Window.clearcolor = BG
+
+        # Request runtime permissions FIRST on Android
+        _request_android_permissions()
+
         self.db    = Database()
         self.alert = AlertSystem()
         self.db.log("INFO", "Nexus Vision started – real scan initiated")
