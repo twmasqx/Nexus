@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 180   # البناء قد يستغرق 45–90 دقيقة
 
     steps:
       # ── 1. Checkout ──────────────────────────────────────────────────────
@@ -37,7 +38,7 @@ jobs:
       - name: Install Python build tools
         run: |
           pip install --upgrade pip setuptools wheel
-          pip install "Cython<3.0"
+          pip install "Cython>=0.29.33,<3.0"
           pip install buildozer
 
       # ── 5. Cache buildozer (~1 GB) ────────────────────────────────────────
@@ -45,7 +46,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}-v2
+          key: ${{ runner.os }}-buildozer-py310-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
             ${{ runner.os }}-buildozer-
 
@@ -57,13 +58,12 @@ jobs:
           # Accept all licenses without interactive prompt
           yes | buildozer android p4a -- --help > /dev/null 2>&1 || true
 
-      # ── 7. Build (full output, no pipe truncation) ───────────────────────
+      # ── 7. Build (full output) ────────────────────────────────────────────
       - name: Build debug APK
         env:
           APP_ANDROID_ACCEPT_SDK_LICENSE: "1"
-          ANDROID_SDK_ROOT: /root/.buildozer/android/platform/android-sdk
         run: |
-          # pipefail ensures buildozer exit code propagates
+          unset CC CXX 2>/dev/null || true
           set -o pipefail
           yes | buildozer -v android debug 2>&1 | tee build.log
           echo "Build exit code: $?"
