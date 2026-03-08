@@ -38,7 +38,7 @@ jobs:
       - name: Install Python build tools
         run: |
           pip install --upgrade pip setuptools wheel
-          pip install "Cython>=0.29.33,<3.0"
+          pip install "Cython==0.29.37"
           pip install buildozer
 
       # ── 5. Cache buildozer (~1 GB) ────────────────────────────────────────
@@ -46,7 +46,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: ${{ runner.os }}-buildozer-py310-${{ hashFiles('buildozer.spec') }}
+          key: ${{ runner.os }}-buildozer-master-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
             ${{ runner.os }}-buildozer-
 
