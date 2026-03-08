@@ -823,12 +823,18 @@ class Scanner:
         self._run       = False
         self._seen_conns = set()
         # cache WiFi RSSI per IP (Android)
-        self._rssi_cache: dict = {}   # ip → signal_dbm
+        self._rssi_cache:      dict = {}   # ip → signal_dbm
+        # mDNS device name + type cache
+        self._mdns_cache:      dict = {}   # ip → {name, os, type}
+        # mDNS hostname cache (ip → hostname from mDNS)
+        self._rssi_name_cache: dict = {}   # ip → friendly name
 
     def start(self):
         self._run = True
         threading.Thread(target=self._loop_arp,     daemon=True).start()
         threading.Thread(target=self._loop_traffic, daemon=True).start()
+        threading.Thread(target=self._loop_mdns,    daemon=True).start()
+        threading.Thread(target=self._loop_ssdp,    daemon=True).start()
 
     def stop(self):
         self._run = False
@@ -1136,17 +1142,79 @@ class Scanner:
 
         return "Unknown"
 
-    # ── ARP loop ─────────────────────────────────────────────────────────
+    # ── ARP loop (Method 1 + 2) ──────────────────────────────────────────
     def _loop_arp(self):
         while self._run:
             try:
+                # Step 1: ping sweep to populate ARP cache before reading it
+                self._ping_sweep()
+                # Step 2: read ARP table (now populated)
                 self._scan_arp()
+                # Step 3: Android extras
                 if ANDROID:
                     self._scan_wifi()
                     self._scan_bt()
+                    self._scan_nsd()
             except Exception:
                 pass
             time.sleep(self.db.setting("scan_interval", 15))
+
+    # ─── Method 2: Active ping sweep ─────────────────────────────────────
+    def _ping_sweep(self):
+        """
+        Ping all 254 hosts in the local subnet in parallel.
+        This populates the OS ARP cache so _read_arp() finds devices.
+        Runs fast: 50 threads, 0.5 s timeout each.
+        """
+        my_ip = Scanner.my_ip()
+        if my_ip in ("Unknown", ""):
+            return
+        parts = my_ip.split(".")
+        if len(parts) != 4:
+            return
+        subnet = ".".join(parts[:3])
+
+        def _probe(ip):
+            # ICMP echo via raw socket (works without root on most Android)
+            # Fallback: TCP connect to common ports
+            if not ANDROID:
+                try:
+                    sys_name = platform.system()
+                    flag = "-n" if sys_name == "Windows" else "-c"
+                    w_flag = ["-w", "500"] if sys_name == "Windows" else ["-W", "1"]
+                    subprocess.run(
+                        ["ping", flag, "1"] + w_flag + [ip],
+                        capture_output=True, timeout=1.5
+                    )
+                    return
+                except Exception:
+                    pass
+            # TCP fallback (Android + fallback)
+            for port in (80, 443, 8080, 7000, 5353, 22):
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(0.5)
+                    s.connect_ex((ip, port))
+                    s.close()
+                    return
+                except Exception:
+                    pass
+
+        threads = []
+        for i in range(1, 255):
+            ip = f"{subnet}.{i}"
+            if ip == my_ip:
+                continue
+            t = threading.Thread(target=_probe, args=(ip,), daemon=True)
+            threads.append(t)
+            t.start()
+            # Limit concurrency: launch in batches of 50
+            if len(threads) >= 50:
+                for t2 in threads:
+                    t2.join(timeout=0.6)
+                threads = []
+        for t in threads:
+            t.join(timeout=0.6)
 
     @staticmethod
     def _is_real_device(ip: str, mac: str) -> bool:
@@ -1185,20 +1253,51 @@ class Scanner:
             return False
 
     def _scan_arp(self):
+        """
+        Read ARP table and register ALL discovered LAN devices.
+        Phones are detected via OUI, mDNS names, or port fingerprinting.
+        Unknown-MAC devices are probed via ports to guess type.
+        """
         for ip, mac in self._read_arp():
             if not self._is_real_device(ip, mac):
                 continue
-            mfr  = _oui(mac)
-            os_  = _guess_os(mfr)
-            name = self._hostname(ip) or f"Host-{ip.split('.')[-1]}"
-            dev_stub = {"manufacturer": mfr, "os": os_, "name": name}
 
-            # ── PHONES ONLY ──────────────────────────────────────────
-            if not _is_phone(dev_stub):
+            mfr      = _oui(mac)
+            os_      = _guess_os(mfr)
+            # Try hostname resolution
+            hostname = (self._rssi_name_cache.get(ip)        # from mDNS cache
+                        or self._hostname(ip)
+                        or f"Device-{ip.split('.')[-1]}")
+            name = hostname
+
+            # ── Phone detection: OUI match OR mDNS name OR port fingerprint
+            dev_stub  = {"manufacturer": mfr, "os": os_, "name": name}
+            is_phone  = _is_phone(dev_stub)
+
+            # Extra: if mDNS cache has phone info, trust it
+            mdns_info = self._mdns_cache.get(ip, {})
+            if mdns_info.get("type") == "phone":
+                is_phone = True
+                if mdns_info.get("name"):
+                    name = mdns_info["name"]
+                if mdns_info.get("os"):
+                    os_ = mdns_info["os"]
+
+            # Extra: if MAC is totally unknown, try port fingerprint
+            if not is_phone and mfr == "Unknown":
+                is_phone = self._port_fingerprint_is_phone(ip)
+                if is_phone:
+                    os_ = "Android"   # best guess for unknown phone
+
+            # Still not a phone? skip (phones only on radar)
+            if not is_phone:
                 continue
 
+            # If manufacturer still unknown but we identified as phone
+            if mfr == "Unknown":
+                mfr = "Phone"   # generic label so it's not "Unknown"
+
             is_new  = self.db.get(mac) is None
-            # use real RSSI if available from WiFi scan cache
             signal  = self._rssi_cache.get(ip, -55)
             dev = self.db.upsert(
                 mac, ip=ip, name=name, manufacturer=mfr,
@@ -1212,14 +1311,34 @@ class Scanner:
                     is_intruder = self.db.is_intruder(mac)
                     title   = "INTRUDER ALERT" if is_intruder else "New Phone Detected"
                     message = (f"Unknown device: {name} [{mfr}]"
-                               if is_intruder else
-                               f"{name}  [{mfr} / {os_}]  IP:{ip}")
+                               if is_intruder
+                               else f"{name}  [{mfr} / {os_}]  IP:{ip}")
                     self.alert.trigger(title, message, mac)
                 threading.Thread(
                     target=self._port_scan, args=(ip, mac), daemon=True
                 ).start()
             Clock.schedule_once(lambda dt, d=dev: self.on_device(d), 0)
         self.db.save()
+
+    def _port_fingerprint_is_phone(self, ip: str) -> bool:
+        """
+        Quick port check: if device has any phone-typical open port, treat as phone.
+        Runs with very short timeout to not slow down discovery.
+        Phone-typical ports: 5353 (mDNS), 62078 (iPhone), 7000 (AirPlay),
+                             5555 (ADB), 8080, 8888 (Android hotspot).
+        """
+        PHONE_PORTS = (5353, 62078, 7000, 5555, 8888, 7100, 3689)
+        for port in PHONE_PORTS:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(0.25)
+                if s.connect_ex((ip, port)) == 0:
+                    s.close()
+                    return True
+                s.close()
+            except Exception:
+                pass
+        return False
 
     # ── Port scanner ─────────────────────────────────────────────────
     # Common ports found open on phones
@@ -1293,6 +1412,11 @@ class Scanner:
             return None
 
     def _scan_wifi(self):
+        """
+        Android WiFi scan — discovers nearby APs.
+        Uses the BSSID list to cross-reference with ARP table results.
+        Records RSSI for accurate radar distance.
+        """
         try:
             act = _PythonActivity.mActivity
             wm  = act.getSystemService(_Context.WIFI_SERVICE)
@@ -1302,27 +1426,39 @@ class Scanner:
                 ssid = str(ap.SSID) or "Hidden-AP"
                 sig  = int(ap.level)
                 mfr  = _oui(mac)
-                # ── update RSSI in db if we already know this device ────
+                # Update existing device RSSI
                 dev_in_db = self.db.get(mac)
                 if dev_in_db:
                     dev_in_db["signal"] = sig
                     ip = dev_in_db.get("ip", "")
                     if ip:
                         self._rssi_cache[ip] = sig
-                    # refresh radar blip with updated signal
                     Clock.schedule_once(
                         lambda dt, d=dev_in_db: self.on_device(d), 0)
-                # skip adding APs to device list (we only track phones)
-                continue
-                new = self.db.get(mac) is None
-                dev = self.db.upsert(
-                    mac, name=f"AP:{ssid}", manufacturer=mfr,
-                    os="Router/AP", signal=sig, dtype="router"
-                )
-                if new:
-                    self.db.log("INFO",
-                                f"WiFi AP: {ssid}  MAC:{mac}  RSSI:{sig}dBm")
-                Clock.schedule_once(lambda dt, d=dev: self.on_device(d), 0)
+        except Exception:
+            pass
+
+        # Extra: get current connection info for own IP RSSI
+        try:
+            act  = _PythonActivity.mActivity
+            wm   = act.getSystemService(_Context.WIFI_SERVICE)
+            info = wm.getConnectionInfo()
+            rssi = int(info.getRssi())
+            my_ip = Scanner.my_ip()
+            if my_ip not in ("Unknown", ""):
+                self._rssi_cache[my_ip] = rssi
+        except Exception:
+            pass
+
+    def _scan_nsd(self):
+        """
+        Android NSD (Network Service Discovery) – discovers services on LAN.
+        Runs a quick mDNS multicast query directly via UDP socket.
+        Works without root on Android 6+.
+        """
+        try:
+            # Use multicast socket to send mDNS query
+            self._scan_mdns()
         except Exception:
             pass
 
@@ -1345,6 +1481,257 @@ class Scanner:
                     Clock.schedule_once(lambda dt, d=dev: self.on_device(d), 0)
         except Exception:
             pass
+
+    # ─── Method 3: mDNS / Bonjour discovery ──────────────────────────────
+    def _loop_mdns(self):
+        """
+        Continuously sends mDNS queries every 20 s.
+        iPhones announce as 'iPhone.local', Android phones as '<model>.local'.
+        No root needed — uses UDP multicast on port 5353.
+        """
+        while self._run:
+            try:
+                self._scan_mdns()
+            except Exception:
+                pass
+            time.sleep(20)
+
+    def _scan_mdns(self):
+        """
+        Send mDNS PTR query to 224.0.0.251:5353.
+        Parse responses for A/AAAA records → map hostname → IP.
+        """
+        MDNS_ADDR = "224.0.0.251"
+        MDNS_PORT = 5353
+        # Minimal mDNS query: PTR "_services._dns-sd._udp.local"
+        # Transaction ID=0, FLAGS=0 (standard query)
+        # Question: _services._dns-sd._udp.local PTR IN
+        query = (
+            b'\x00\x00'   # transaction ID
+            b'\x00\x00'   # flags: standard query
+            b'\x00\x01'   # 1 question
+            b'\x00\x00\x00\x00\x00\x00'  # 0 answers/auth/additional
+            b'\x09_services\x07_dns-sd\x04_udp\x05local\x00'
+            b'\x00\x0c'   # type PTR
+            b'\x00\x01'   # class IN
+        )
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.settimeout(3.0)
+            # Set multicast TTL
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            sock.sendto(query, (MDNS_ADDR, MDNS_PORT))
+
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                try:
+                    data, addr = sock.recvfrom(4096)
+                    ip = addr[0]
+                    if not self._is_real_device(ip, "AA:BB:CC:DD:EE:FF"):
+                        continue
+                    # Parse the hostname from mDNS response
+                    hostname = self._parse_mdns_name(data)
+                    if hostname:
+                        self._rssi_name_cache[ip] = hostname
+                        # Detect phone type from hostname
+                        hn_lower = hostname.lower()
+                        entry = {"name": hostname, "type": "unknown", "os": "Unknown"}
+                        if any(kw in hn_lower for kw in
+                               ("iphone", "ipad", "macbook", "apple")):
+                            entry.update({"type": "phone", "os": "iOS/macOS"})
+                        elif any(kw in hn_lower for kw in
+                                 ("android", "phone", "samsung", "xiaomi",
+                                  "redmi", "huawei", "oppo", "vivo", "pixel",
+                                  "galaxy", "note", "poco", "realme")):
+                            entry.update({"type": "phone", "os": "Android"})
+                        self._mdns_cache[ip] = entry
+
+                        # If we know the IP, update or create device entry
+                        self._register_mdns_device(ip, hostname,
+                                                   entry.get("os", "Unknown"))
+                except socket.timeout:
+                    break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _parse_mdns_name(data: bytes) -> str:
+        """Extract first DNS name label from mDNS packet (simple parser)."""
+        try:
+            # Skip header (12 bytes), parse first question/answer name
+            pos = 12
+            labels = []
+            while pos < len(data):
+                length = data[pos]
+                if length == 0:
+                    break
+                if length >= 0xC0:   # pointer
+                    ptr = ((length & 0x3F) << 8) | data[pos + 1]
+                    pos = ptr
+                    continue
+                pos += 1
+                label = data[pos:pos + length].decode("utf-8", errors="ignore")
+                labels.append(label)
+                pos += length
+            return ".".join(labels) if labels else ""
+        except Exception:
+            return ""
+
+    def _register_mdns_device(self, ip: str, hostname: str, os_: str):
+        """Register or update a device discovered via mDNS."""
+        # Try to find MAC from ARP
+        mac = self._ip_to_mac(ip)
+        if not mac:
+            # Generate pseudo-MAC from IP (unique but deterministic)
+            parts = ip.split(".")
+            mac = "FE:FE:{:02X}:{:02X}:{:02X}:{:02X}".format(
+                int(parts[0]) if len(parts) > 0 else 0,
+                int(parts[1]) if len(parts) > 1 else 0,
+                int(parts[2]) if len(parts) > 2 else 0,
+                int(parts[3]) if len(parts) > 3 else 0,
+            )
+        mfr = _oui(mac)
+        if mfr == "Unknown":
+            # Infer from hostname
+            hn = hostname.lower()
+            if "iphone" in hn or "ipad" in hn:
+                mfr, os_ = "Apple", "iOS/macOS"
+            elif "samsung" in hn:
+                mfr, os_ = "Samsung", "Android"
+            elif "xiaomi" in hn or "redmi" in hn or "poco" in hn:
+                mfr, os_ = "Xiaomi", "Android"
+            elif "huawei" in hn or "honor" in hn:
+                mfr, os_ = "Huawei", "Android"
+            elif "pixel" in hn:
+                mfr, os_ = "Google", "Android"
+            else:
+                mfr = "Phone"
+        name     = hostname.split(".")[0] or hostname
+        signal   = self._rssi_cache.get(ip, -60)
+        is_new   = self.db.get(mac) is None
+        dev = self.db.upsert(mac, ip=ip, name=name, manufacturer=mfr,
+                              os=os_, signal=signal, dtype="phone")
+        if is_new:
+            self.db.log("INFO",
+                        f"mDNS device: {name}  [{mfr}]  IP:{ip}")
+            if self.alert and self.db.setting("alert_new_device"):
+                self.alert.trigger("New Device", f"{name} [{mfr}]", mac)
+            threading.Thread(
+                target=self._port_scan, args=(ip, mac), daemon=True).start()
+        Clock.schedule_once(lambda dt, d=dev: self.on_device(d), 0)
+
+    def _ip_to_mac(self, ip: str) -> str:
+        """Look up MAC for a given IP from ARP table."""
+        for arp_ip, arp_mac in self._read_arp():
+            if arp_ip == ip:
+                return arp_mac
+        return ""
+
+    # ─── Method 4: SSDP / UPnP discovery ─────────────────────────────────
+    def _loop_ssdp(self):
+        """
+        Sends SSDP M-SEARCH every 30 s.
+        Many Android phones and smart devices respond.
+        No root needed.
+        """
+        while self._run:
+            try:
+                self._scan_ssdp()
+            except Exception:
+                pass
+            time.sleep(30)
+
+    def _scan_ssdp(self):
+        """
+        Send SSDP M-SEARCH multicast and parse responses.
+        Extracts IP and device description from Location header.
+        """
+        SSDP_ADDR = "239.255.255.250"
+        SSDP_PORT = 1900
+        SSDP_MSG  = (
+            "M-SEARCH * HTTP/1.1\r\n"
+            "HOST: 239.255.255.250:1900\r\n"
+            "MAN: \"ssdp:discover\"\r\n"
+            "MX: 2\r\n"
+            "ST: ssdp:all\r\n"
+            "\r\n"
+        ).encode()
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            sock.settimeout(4.0)
+            sock.sendto(SSDP_MSG, (SSDP_ADDR, SSDP_PORT))
+
+            deadline = time.time() + 4.0
+            while time.time() < deadline:
+                try:
+                    data, addr = sock.recvfrom(1024)
+                    ip = addr[0]
+                    if not self._is_real_device(ip, "AA:BB:CC:DD:EE:FF"):
+                        continue
+                    text     = data.decode("utf-8", errors="ignore")
+                    server   = ""
+                    location = ""
+                    for line in text.splitlines():
+                        ll = line.lower()
+                        if ll.startswith("server:"):
+                            server = line.split(":", 1)[1].strip()
+                        elif ll.startswith("location:"):
+                            location = line.split(":", 1)[1].strip()
+
+                    # Guess device type from Server header
+                    sl  = server.lower()
+                    is_p = any(kw in sl for kw in
+                               ("android", "samsung", "xiaomi", "redmi",
+                                "huawei", "iphone", "apple", "lg ", "sony",
+                                "oppo", "vivo", "google", "pixel"))
+                    if is_p or ip not in self._mdns_cache:
+                        mac  = self._ip_to_mac(ip) or ""
+                        mfr  = _oui(mac) if mac else "Unknown"
+                        if mfr == "Unknown" and server:
+                            mfr = "Phone" if is_p else "Unknown"
+                        if not mac:
+                            parts = ip.split(".")
+                            mac = "FD:FD:{:02X}:{:02X}:{:02X}:{:02X}".format(
+                                int(parts[0]) if len(parts) > 0 else 0,
+                                int(parts[1]) if len(parts) > 1 else 0,
+                                int(parts[2]) if len(parts) > 2 else 0,
+                                int(parts[3]) if len(parts) > 3 else 0,
+                            )
+                        name   = (server[:30] if server else f"Device-{ip.split('.')[-1]}")
+                        os_    = "Android" if "android" in sl else (
+                                 "iOS/macOS" if "apple" in sl else "Unknown")
+                        signal = self._rssi_cache.get(ip, -65)
+                        is_new = self.db.get(mac) is None
+                        if not is_p and not is_new:
+                            continue   # only add new non-phone SSDP devices if they respond
+                        dev = self.db.upsert(mac, ip=ip, name=name,
+                                              manufacturer=mfr, os=os_,
+                                              signal=signal, dtype="phone" if is_p else "other")
+                        if is_new:
+                            self.db.log("INFO",
+                                        f"SSDP device: {name}  IP:{ip}  [{server[:40]}]")
+                        Clock.schedule_once(lambda dt, d=dev: self.on_device(d), 0)
+                except socket.timeout:
+                    break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
     # ── TCP traffic loop ─────────────────────────────────────────────────
     def _loop_traffic(self):
@@ -1817,7 +2204,8 @@ class RadarScreen(BaseScreen):
         self.root_box.add_widget(hud_row)
 
     def on_device(self, dev):
-        if not _is_phone(dev):
+        # Show on radar: phones + any device explicitly typed as phone
+        if not (_is_phone(dev) or dev.get('dtype') == 'phone'):
             return
         mac = dev['mac']
         self.radar.set_device(
