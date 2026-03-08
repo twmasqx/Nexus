@@ -12,7 +12,9 @@ source.include_exts   = py,png,jpg,kv,atlas,json,wav
 source.exclude_dirs   = __pycache__,.buildozer,.git,tests
 
 # ── Requirements ──────────────────────────────────────────────────────────────
-requirements = python3,kivy==2.3.0,plyer
+# CRITICAL: python3==3.10 — Python 3.14 breaks Kivy config.pxi / Cython build
+# hostpython3==3.10 — match host toolchain to target
+requirements = python3==3.10,hostpython3==3.10,kivy==2.3.0,plyer,Cython>=0.29.33,<3.0
 
 # ── Display ───────────────────────────────────────────────────────────────────
 orientation  = portrait
@@ -36,7 +38,8 @@ android.enable_androidx = True
 android.permissions = INTERNET,ACCESS_NETWORK_STATE,ACCESS_WIFI_STATE,CHANGE_WIFI_STATE,ACCESS_FINE_LOCATION,ACCESS_COARSE_LOCATION,CHANGE_NETWORK_STATE,BLUETOOTH,BLUETOOTH_ADMIN,BLUETOOTH_SCAN,BLUETOOTH_CONNECT,VIBRATE,READ_PHONE_STATE,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,RECEIVE_BOOT_COMPLETED
 
 # ── p4a ───────────────────────────────────────────────────────────────────────
-p4a.branch = develop
+# master = stable, develop = Python 3.14 default (breaks Kivy)
+p4a.branch = master
 
 [buildozer]
 log_level    = 2
