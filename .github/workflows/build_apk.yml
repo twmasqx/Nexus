@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180   # البناء قد يستغرق 45–90 دقيقة
+    timeout-minutes: 180
 
     steps:
       # ── 1. Checkout ──────────────────────────────────────────────────────
@@ -34,14 +34,22 @@ jobs:
             python3-dev build-essential \
             libltdl-dev ccache
 
-      # ── 4. Python packages ───────────────────────────────────────────────
+      # ── 4. Force Java 17 as default ──────────────────────────────────────
+      - name: Set Java 17 as default
+        run: |
+          sudo update-java-alternatives --set java-1.17.0-openjdk-amd64
+          java -version
+          javac -version
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> $GITHUB_ENV
+
+      # ── 5. Python packages ───────────────────────────────────────────────
       - name: Install Python build tools
         run: |
           pip install --upgrade pip setuptools wheel
           pip install "Cython==0.29.37"
           pip install buildozer
 
-      # ── 5. Cache buildozer (~1 GB) ────────────────────────────────────────
+      # ── 6. Cache buildozer (~1 GB) ────────────────────────────────────────
       - name: Cache buildozer directory
         uses: actions/cache@v4
         with:
@@ -50,36 +58,39 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-buildozer-
 
-      # ── 6. Accept Android SDK licenses manually ──────────────────────────
-      - name: Pre-accept Android SDK licenses
+      # ── 7. Accept Android SDK licenses ───────────────────────────────────
+      - name: Accept Android SDK licenses
         run: |
           mkdir -p ~/.android
           touch ~/.android/repositories.cfg
-          # Accept all licenses without interactive prompt
-          yes | buildozer android p4a -- --help > /dev/null 2>&1 || true
+          mkdir -p ~/.buildozer/android/platform
+          echo "sdk.dir=$HOME/.buildozer/android/platform/android-sdk" > local.properties
 
-      # ── 7. Build (full output) ────────────────────────────────────────────
+      # ── 8. Build APK ──────────────────────────────────────────────────────
       - name: Build debug APK
         env:
           APP_ANDROID_ACCEPT_SDK_LICENSE: "1"
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
         run: |
           unset CC CXX 2>/dev/null || true
           set -o pipefail
-          yes | buildozer -v android debug 2>&1 | tee build.log
-          echo "Build exit code: $?"
+          yes | buildozer -v android debug 2>&1 | tee build.log || BUILD_FAILED=1
 
-      # ── 8. Show last 100 lines of log on failure ─────────────────────────
-      - name: Show build log tail (on failure)
-        if: failure()
-        run: |
-          echo "=== LAST 100 LINES OF BUILD LOG ==="
-          tail -100 build.log || echo "No log file found"
-          echo ""
-          echo "=== SEARCHING FOR APK FILES ==="
-          find . -name "*.apk" 2>/dev/null || echo "No APK found"
-          echo ""
-          echo "=== BIN DIRECTORY CONTENTS ==="
-          ls -la bin/ 2>/dev/null || echo "bin/ does not exist"
+          if [ "${BUILD_FAILED}" = "1" ]; then
+            echo ""
+            echo "========================================="
+            echo "         BUILD FAILED — ERROR LOG        "
+            echo "========================================="
+            echo ""
+            echo "--- LAST 200 LINES OF BUILD LOG ---"
+            tail -200 build.log
+            echo ""
+            echo "--- SEARCHING FOR INNER P4A CRASH LOGS ---"
+            find .buildozer -name "*.log" 2>/dev/null | while read f; do
+              echo "=== $f (last 30 lines) ==="; tail -30 "$f"; echo ""
+            done
+            exit 1
+          fi
 
       # ── 9. Upload APK ────────────────────────────────────────────────────
       - name: Upload APK artifact
@@ -91,7 +102,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # ── 10. Upload build log (always, for debugging) ─────────────────────
+      # ── 10. Upload full build log (always) ───────────────────────────────
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
