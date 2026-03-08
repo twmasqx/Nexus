@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-22.04     # 22.04 required for libtinfo5 compatibility
 
     steps:
-      # ── 1. Checkout ──────────────────────────────────────────────────────
+      # ── 1. Checkout ─────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
