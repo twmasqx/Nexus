@@ -1,0 +1,66 @@
+name: Build Nexus Vision APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:          # allow manual trigger from GitHub UI
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04     # 22.04 required for libtinfo5 compatibility
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python 3.10 ───────────────────────────────────────────────────
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # ── 3. System dependencies ───────────────────────────────────────────
+      - name: Install system packages
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            git zip unzip \
+            openjdk-17-jdk \
+            autoconf automake libtool pkg-config \
+            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
+            cmake libffi-dev libssl-dev \
+            python3-dev build-essential \
+            libltdl-dev
+
+      # ── 4. Python packages ───────────────────────────────────────────────
+      - name: Install Python build tools
+        run: |
+          pip install --upgrade pip setuptools wheel
+          pip install "Cython<3.0"
+          pip install buildozer
+
+      # ── 5. Cache buildozer downloads (~1 GB) ─────────────────────────────
+      - name: Cache buildozer global directory
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: ${{ runner.os }}-buildozer-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            ${{ runner.os }}-buildozer-
+
+      # ── 6. Build ─────────────────────────────────────────────────────────
+      - name: Build debug APK
+        env:
+          APP_ANDROID_ACCEPT_SDK_LICENSE: "1"
+        run: |
+          yes | buildozer -v android debug 2>&1 | tail -200
+
+      # ── 7. Upload artifact ───────────────────────────────────────────────
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-vision-debug-apk
+          path: bin/*.apk
+          if-no-files-found: error
+          retention-days: 30
