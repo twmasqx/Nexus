@@ -73,21 +73,24 @@ jobs:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
         run: |
           unset CC CXX 2>/dev/null || true
-          set -o pipefail
-          yes | buildozer -v android debug 2>&1 | tee build.log || BUILD_FAILED=1
+          # NOTE: do NOT use set -o pipefail here.
+          # `yes` exits with SIGPIPE (141) when buildozer closes stdin,
+          # which would mark a SUCCESSFUL build as failed.
+          # Use PIPESTATUS[1] to get buildozer's own exit code instead.
+          yes 2>/dev/null | buildozer -v android debug 2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[1]}
 
-          if [ "${BUILD_FAILED}" = "1" ]; then
+          if [ "${BUILD_EXIT}" != "0" ]; then
             echo ""
             echo "========================================="
             echo "         BUILD FAILED — ERROR LOG        "
             echo "========================================="
-            echo ""
-            echo "--- LAST 200 LINES OF BUILD LOG ---"
+            echo "--- LAST 200 LINES ---"
             tail -200 build.log
             echo ""
-            echo "--- SEARCHING FOR INNER P4A CRASH LOGS ---"
+            echo "--- P4A CRASH LOGS ---"
             find .buildozer -name "*.log" 2>/dev/null | while read f; do
-              echo "=== $f (last 30 lines) ==="; tail -30 "$f"; echo ""
+              echo "=== $f (last 30 lines) ==="; tail -30 "$f"
             done
             exit 1
           fi
