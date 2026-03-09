@@ -228,46 +228,217 @@ _DOMAIN_SVC = [
 ]
 
 
+_OUI_EXT:   dict = {}   # loaded from oui.json at runtime
+_OUI_CACHE: dict = {}   # runtime cache for live API lookups
+_OUI_CACHE_PATH: str = ""
+
+# ─── Live OUI APIs (tried in order) ──────────────────────────────────────────
+_OUI_APIS = [
+    "https://api.macvendors.com/{mac}",                  # returns plain text
+    "https://api.maclookup.app/v2/macs/{mac}/company/name",  # plain text
+]
+
+def _oui_cache_path() -> str:
+    global _OUI_CACHE_PATH
+    if _OUI_CACHE_PATH:
+        return _OUI_CACHE_PATH
+    candidates = [os.path.dirname(os.path.abspath(__file__)), os.getcwd()]
+    if ANDROID:
+        candidates = [
+            "/data/data/org.nexus.vision/files",
+            os.environ.get("ANDROID_PRIVATE", "/data/data/org.nexus.vision/files"),
+        ] + candidates
+    for d in candidates:
+        try:
+            p = os.path.join(d, "oui_cache.json")
+            open(p, "a").close()
+            _OUI_CACHE_PATH = p
+            return p
+        except Exception:
+            pass
+    return ""
+
+def _load_oui_json():
+    """Load extended OUI table from oui.json + persisted live cache."""
+    global _OUI_EXT, _OUI_CACHE
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "oui.json"),
+        os.path.join(os.getcwd(), "oui.json"),
+    ]
+    if ANDROID:
+        candidates += [
+            "/data/data/org.nexus.vision/files/oui.json",
+            os.path.join(os.environ.get("ANDROID_PRIVATE", ""), "oui.json"),
+        ]
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as f:
+                _OUI_EXT = json.load(f)
+            break
+        except Exception:
+            pass
+    # Load persisted live-lookup cache
+    cp = _oui_cache_path()
+    if cp:
+        try:
+            with open(cp, encoding="utf-8") as f:
+                _OUI_CACHE = json.load(f)
+        except Exception:
+            _OUI_CACHE = {}
+
+_load_oui_json()
+
+def _oui_live_lookup(mac: str) -> str:
+    """Query live API for unknown MAC prefix (runs in background thread only)."""
+    prefix = mac.upper()[:8]
+    if prefix in _OUI_CACHE:
+        return _OUI_CACHE[prefix]
+    # Skip pseudo / broadcast MACs
+    if mac.startswith(("FE:FF", "FD:FE", "FF:FF", "00:00")):
+        return "Unknown"
+    try:
+        import urllib.request as _ur
+        for api in _OUI_APIS:
+            try:
+                url = api.format(mac=mac.replace(":", "-")[:8])
+                req = _ur.Request(url, headers={"User-Agent": "NexusVision/1.0"})
+                with _ur.urlopen(req, timeout=4) as r:
+                    vendor = r.read().decode("utf-8", errors="ignore").strip()
+                if vendor and len(vendor) < 80 and "error" not in vendor.lower():
+                    # Persist to cache
+                    _OUI_CACHE[prefix] = vendor
+                    cp = _oui_cache_path()
+                    if cp:
+                        try:
+                            with open(cp, "w", encoding="utf-8") as f:
+                                json.dump(_OUI_CACHE, f)
+                        except Exception:
+                            pass
+                    return vendor
+            except Exception:
+                continue
+    except Exception:
+        pass
+    _OUI_CACHE[prefix] = "Unknown"
+    return "Unknown"
+
 def _oui(mac: str) -> str:
-    return _OUI.get(mac.upper()[:8], "Unknown")
+    """Look up manufacturer from MAC address.
+    Priority: inline dict → oui.json → live API cache → 'Unknown'."""
+    m = mac.upper()
+    # 1. Full 8-char prefix (XX:XX:XX)
+    v = _OUI.get(m[:8]) or _OUI_EXT.get(m[:8]) or _OUI_CACHE.get(m[:8])
+    if v and v != "Unknown":
+        return v
+    # 2. Short 5-char prefix (XX:XX) for wildcard entries
+    v = _OUI.get(m[:5]) or _OUI_EXT.get(m[:5])
+    if v and v != "Unknown":
+        return v
+    # 3. Check live cache only (never blocks – API call is always async)
+    return _OUI_CACHE.get(m[:8], "Unknown")
 
 
 def _guess_os(mfr: str) -> str:
     if mfr == "Apple":
         return "iOS/macOS"
     if mfr in {"Samsung", "Google", "Huawei", "Xiaomi", "OnePlus", "OPPO",
-               "Realme", "LG", "Sony", "Motorola", "Nokia"}:
+               "Realme", "LG", "Sony", "Motorola", "Nokia", "Vivo",
+               "Infinix", "Tecno", "Itel", "ZTE", "Meizu", "HTC",
+               "TCL", "Alcatel", "BlackBerry", "Honor", "Nothing",
+               "Fairphone", "Redmi", "POCO"}:
         return "Android"
-    if mfr in {"Cisco", "Netgear", "TP-Link", "DLink", "Tenda"}:
+    if mfr in {"Cisco", "Netgear", "TP-Link", "DLink", "Tenda",
+               "Linksys", "Mercusys", "Edimax"}:
         return "Router/AP"
+    if mfr in {"Hikvision", "Dahua", "Axis", "Reolink", "Arlo",
+               "Nest", "Wyze", "Espressif"}:
+        return "Camera/IoT"
     if mfr == "Microsoft":
         return "Windows"
+    if mfr in {"Intel", "Realtek", "Dell", "HP"}:
+        return "PC/Laptop"
     if mfr in {"RaspberryPi"}:
         return "Linux/Server"
     return "Unknown"
 
 
 _PHONE_MFRS = {
-    # Major global brands
-    "Apple", "Samsung", "Google", "Huawei", "Xiaomi",
-    "OnePlus", "OPPO", "Realme", "LG", "Sony", "Motorola", "Nokia",
-    # Additional brands for broad compatibility
-    "Vivo", "Tecno", "Infinix", "Itel", "ZTE", "Meizu",
-    "HTC", "Lenovo", "Asus", "TCL", "Alcatel", "BlackBerry",
-    "Honor", "Nothing", "Fairphone", "Poco",
-    # Arabic / regional market brands
-    "Redmi", "MIUI",
+    # Apple
+    "Apple",
+    # Samsung
+    "Samsung",
+    # Xiaomi ecosystem (Redmi / POCO are Xiaomi sub-brands)
+    "Xiaomi", "Redmi", "POCO",
+    # Infinix / Transsion group
+    "Infinix", "Tecno", "Itel",
+    # Other major Android OEMs
+    "Google", "Huawei", "Honor", "OnePlus", "OPPO", "Realme", "Vivo",
+    "LG", "Sony", "Motorola", "Nokia", "ZTE", "Meizu", "HTC",
+    "Lenovo", "TCL", "Alcatel", "BlackBerry", "Nothing", "Fairphone",
+    "MIUI",
 }
 
+_CAMERA_MFRS = {
+    "Hikvision", "Dahua", "Axis", "Reolink", "Arlo", "Nest", "Wyze",
+    "Foscam", "Amcrest", "Annke", "Swann", "Lorex", "Hanwha",
+    "Bosch", "Vivotek", "Uniview",
+}
+
+_PC_MFRS = {
+    "Intel", "Realtek", "Dell", "HP", "Lenovo", "Microsoft",
+    "RaspberryPi", "Broadcom",
+}
+
+_ROUTER_MFRS = {
+    "Cisco", "Netgear", "TP-Link", "DLink", "Tenda", "Linksys",
+    "Asus", "Mercusys", "Edimax", "Ubiquiti", "MikroTik",
+    # Note: Huawei intentionally excluded – Huawei phones take priority in _PHONE_MFRS
+}
+
+
 def _is_phone(dev: dict) -> bool:
-    """Return True only for mobile phones (iPhone / Android)."""
-    mfr = dev.get("manufacturer", "")
-    os_ = dev.get("os", "")
-    return mfr in _PHONE_MFRS or os_ in ("iOS/macOS", "Android")
+    mfr   = dev.get("manufacturer", "")
+    os_   = dev.get("os", "")
+    dtype = dev.get("dtype", "")
+    return (mfr in _PHONE_MFRS
+            or os_ in ("iOS/macOS", "Android")
+            or dtype == "phone")
+
+
+def _is_camera(dev: dict) -> bool:
+    mfr   = dev.get("manufacturer", "")
+    dtype = dev.get("dtype", "")
+    os_   = dev.get("os", "")
+    return mfr in _CAMERA_MFRS or dtype == "camera" or os_ == "Camera/IoT"
+
+
+def _is_pc(dev: dict) -> bool:
+    mfr   = dev.get("manufacturer", "")
+    dtype = dev.get("dtype", "")
+    os_   = dev.get("os", "")
+    return mfr in _PC_MFRS or dtype == "pc" or os_ == "PC/Laptop"
+
+
+def _dtype_from_mfr(mfr: str) -> str:
+    """Derive best-guess dtype from manufacturer name."""
+    if mfr in _PHONE_MFRS:
+        return "phone"
+    if mfr in _CAMERA_MFRS:
+        return "camera"
+    if mfr in _ROUTER_MFRS:
+        return "router"
+    if mfr in _PC_MFRS:
+        return "pc"
+    return "other"
+
 
 def _classify(dev: dict) -> str:
     if _is_phone(dev):
         return "phone"
+    if _is_camera(dev):
+        return "camera"
+    if _is_pc(dev):
+        return "pc"
     return "other"
 
 
@@ -292,6 +463,45 @@ def _hex_to_ip4(h: str) -> str:
     except Exception:
         return h
 
+
+def _domain_to_service(domain: str) -> str:
+    """Map a domain name to a human-readable service label."""
+    d = domain.lower()
+    _MAP = [
+        ('whatsapp',  'WhatsApp'),   ('instagram', 'Instagram'),
+        ('facebook',  'Facebook'),   ('tiktok',    'TikTok'),
+        ('youtube',   'YouTube'),    ('googlevideo','YouTube'),
+        ('netflix',   'Netflix'),    ('snapchat',  'Snapchat'),
+        ('spotify',   'Spotify'),    ('twitter',   'Twitter/X'),
+        ('x.com',     'Twitter/X'),  ('telegram',  'Telegram'),
+        ('icloud',    'iCloud'),     ('apple',     'Apple'),
+        ('amazonaws', 'AWS'),        ('google',    'Google'),
+        ('gstatic',   'Google'),     ('googleapis','Google'),
+        ('microsoft', 'Microsoft'),  ('live.com',  'Microsoft'),
+        ('linkedin',  'LinkedIn'),   ('reddit',    'Reddit'),
+        ('pinterest', 'Pinterest'),  ('tumblr',    'Tumblr'),
+        ('discord',   'Discord'),    ('twitch',    'Twitch'),
+        ('zoom',      'Zoom'),       ('teams',     'MS Teams'),
+        ('skype',     'Skype'),      ('viber',     'Viber'),
+        ('line.me',   'Line'),       ('wechat',    'WeChat'),
+        ('amazon',    'Amazon'),     ('ebay',      'eBay'),
+        ('paypal',    'PayPal'),     ('alibaba',   'Alibaba'),
+        ('shopify',   'Shopify'),    ('gmail',     'Gmail'),
+        ('yahoo',     'Yahoo'),      ('bing',      'Bing'),
+        ('baidu',     'Baidu'),      ('cloudflare','Cloudflare'),
+        ('akamai',    'Akamai CDN'), ('cdn',       'CDN'),
+        ('ads',       'Ads'),        ('analytics', 'Analytics'),
+        ('doubleclick','Google Ads'),('adnxs',     'AppNexus Ads'),
+        ('crashlytics','Firebase'),  ('firebase',  'Firebase'),
+        ('goog',      'Google'),     ('1e100',     'Google'),
+    ]
+    for frag, svc in _MAP:
+        if frag in d:
+            return svc
+    # Return nicest part of domain
+    parts = [p for p in d.split('.') if p not in
+             ('www','m','api','cdn','static','media','app')]
+    return parts[0].capitalize() if parts else domain
 
 def _resolve_full(ip: str, port: int) -> tuple:
     """Return (service_label, hostname) for display."""
@@ -481,12 +691,15 @@ class PingMonitor:
 # ─── Speed Test ──────────────────────────────────────────────────────────────
 class SpeedTest:
     """
-    Measures Ping / Download / Upload using standard library only.
-    No external dependencies.
+    Multi-connection speed test using Cloudflare endpoints.
+    Download: 4 parallel streams → accurate for high-speed connections.
+    Upload: 4 parallel streams.
+    Ping: 6 samples to 1.1.1.1:80 → lowest latency reported.
     """
-    PING_HOST  = ("8.8.8.8", 53)
-    DL_URL     = "http://speedtest.tele2.net/1MB.zip"
-    UL_URL     = "https://httpbin.org/post"
+    # Cloudflare speed test CDN — fastest public endpoint
+    DL_URL  = "https://speed.cloudflare.com/__down?bytes=25000000"  # 25 MB
+    UL_URL  = "https://speed.cloudflare.com/__up"
+    STREAMS = 4   # parallel connections
 
     def run(self, on_ping, on_download, on_upload, on_done):
         threading.Thread(
@@ -496,72 +709,115 @@ class SpeedTest:
         ).start()
 
     def _measure(self, on_ping, on_dl, on_ul, on_done):
-        # ── Ping ─────────────────────────────────────────────────────
         ping_ms = self._ping()
         Clock.schedule_once(lambda dt: on_ping(ping_ms), 0)
-
-        # ── Download ─────────────────────────────────────────────────
-        dl_mbps = self._download()
+        dl_mbps = self._download_parallel()
         Clock.schedule_once(lambda dt: on_dl(dl_mbps), 0)
-
-        # ── Upload ───────────────────────────────────────────────────
-        ul_mbps = self._upload()
+        ul_mbps = self._upload_parallel()
         Clock.schedule_once(lambda dt: on_ul(ul_mbps), 0)
-
         Clock.schedule_once(lambda dt: on_done(), 0)
 
+    # ── Ping: 6 samples, pick minimum ─────────────────────────────────
     def _ping(self) -> float:
-        try:
-            times = []
-            for _ in range(4):
+        HOST = ("1.1.1.1", 80)
+        times = []
+        for _ in range(6):
+            try:
                 t0 = time.perf_counter()
                 s  = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(3)
-                s.connect(self.PING_HOST)
+                s.settimeout(4)
+                s.connect(HOST)
                 s.close()
                 times.append((time.perf_counter() - t0) * 1000)
-                time.sleep(0.1)
-            return round(sum(times) / len(times), 1)
-        except Exception:
-            return -1.0
+            except Exception:
+                pass
+            time.sleep(0.05)
+        return round(min(times), 1) if times else -1.0
 
-    def _download(self) -> float:
+    # ── Download: N parallel streams ──────────────────────────────────
+    def _download_parallel(self) -> float:
         import urllib.request
-        try:
-            start      = time.perf_counter()
-            total      = 0
-            req        = urllib.request.Request(
-                self.DL_URL,
-                headers={"User-Agent": "NexusVision/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                while True:
-                    chunk = resp.read(16384)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if time.perf_counter() - start > 10:
-                        break
-            elapsed = time.perf_counter() - start
-            return round((total * 8) / (elapsed * 1_000_000), 2) if elapsed > 0 else 0.0
-        except Exception:
-            return 0.0
+        results = []
+        lock    = threading.Lock()
+        TEST_S  = 8   # seconds per stream
 
-    def _upload(self) -> float:
-        import urllib.request
-        try:
-            data  = b"x" * (256 * 1024)   # 256 KB payload
-            start = time.perf_counter()
-            req   = urllib.request.Request(
-                self.UL_URL, data=data, method="POST",
-                headers={"Content-Type": "application/octet-stream",
-                         "User-Agent": "NexusVision/1.0"}
-            )
-            urllib.request.urlopen(req, timeout=15)
-            elapsed = time.perf_counter() - start
-            return round((len(data) * 8) / (elapsed * 1_000_000), 2) if elapsed > 0 else 0.0
-        except Exception:
+        def _stream():
+            try:
+                req = urllib.request.Request(
+                    self.DL_URL,
+                    headers={"User-Agent": "NexusVision/2.0",
+                             "Cache-Control": "no-cache"}
+                )
+                total = 0
+                start = time.perf_counter()
+                with urllib.request.urlopen(req, timeout=TEST_S + 3) as resp:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if time.perf_counter() - start >= TEST_S:
+                            break
+                elapsed = time.perf_counter() - start
+                if elapsed > 0:
+                    with lock:
+                        results.append(total / elapsed)
+            except Exception:
+                pass
+
+        threads = [threading.Thread(target=_stream, daemon=True)
+                   for _ in range(self.STREAMS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=TEST_S + 5)
+
+        if not results:
             return 0.0
+        total_bps = sum(results)   # parallel streams sum to total bandwidth
+        return round((total_bps * 8) / 1_000_000, 2)
+
+    # ── Upload: N parallel streams ────────────────────────────────────
+    def _upload_parallel(self) -> float:
+        import urllib.request
+        results = []
+        lock    = threading.Lock()
+        CHUNK   = 512 * 1024   # 512 KB per request
+        TEST_S  = 6
+
+        def _stream():
+            try:
+                data  = b"\x00" * CHUNK
+                total = 0
+                start = time.perf_counter()
+                while time.perf_counter() - start < TEST_S:
+                    req = urllib.request.Request(
+                        self.UL_URL, data=data, method="POST",
+                        headers={"Content-Type": "application/octet-stream",
+                                 "User-Agent": "NexusVision/2.0"}
+                    )
+                    try:
+                        urllib.request.urlopen(req, timeout=8)
+                        total += CHUNK
+                    except Exception:
+                        break
+                elapsed = time.perf_counter() - start
+                if elapsed > 0:
+                    with lock:
+                        results.append(total / elapsed)
+            except Exception:
+                pass
+
+        threads = [threading.Thread(target=_stream, daemon=True)
+                   for _ in range(self.STREAMS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=TEST_S + 8)
+
+        if not results:
+            return 0.0
+        return round((sum(results) * 8) / 1_000_000, 2)
 
 
 # ─── Database ────────────────────────────────────────────────────────────────
@@ -602,6 +858,7 @@ class Database:
             "devices":  {},
             "log":      [],
             "traffic":  [],
+            "dns_log":  [],
             "settings": {
                 "alert_unknown":    True,
                 "alert_new_device": True,
@@ -622,9 +879,14 @@ class Database:
         try:
             if self.path.exists():
                 with open(self.path) as f:
-                    self._d.update(json.load(f))
+                    loaded = json.load(f)
+                    self._d.update(loaded)
         except Exception:
             pass
+        # Ensure all top-level keys exist (migration safety)
+        for k in ("devices", "log", "traffic", "dns_log"):
+            self._d.setdefault(k, [] if k != "devices" else {})
+        self._d.setdefault("settings", {})
 
     def save(self):
         """Thread-safe save; skips if nothing changed."""
@@ -643,7 +905,15 @@ class Database:
         self._d["devices"] = {}
         self._d["log"]     = []
         self._d["traffic"] = []
+        self._d["dns_log"] = []
+        # Clear per-device dns_visits too
+        try:
+            if self.path.exists():
+                self.path.unlink()
+        except Exception:
+            pass
         self.save()
+        self.log("INFO", "Database cleared — fresh start")
 
     def set_setting(self, key, value):
         self._d["settings"][key] = value
@@ -734,6 +1004,43 @@ class Database:
             if d.get("ip") == ip:
                 return d
         return None
+
+    def add_dns_event(self, src_ip: str, domain: str, qtype: str = "A"):
+        """Record a DNS query (domain lookup) seen from a device."""
+        if not domain or domain.endswith(('.local', '.arpa')):
+            return   # skip mDNS noise
+        e = {
+            "time":   datetime.now().strftime("%H:%M:%S"),
+            "date":   datetime.now().strftime("%Y-%m-%d"),
+            "src":    src_ip,
+            "domain": domain,
+            "qtype":  qtype,
+        }
+        self._d["dns_log"].insert(0, e)
+        if len(self._d["dns_log"]) > 2000:
+            self._d["dns_log"] = self._d["dns_log"][:2000]
+        # Also attach to device phone_log / dns_visits
+        dev = self._find_by_ip(src_ip)
+        if dev:
+            visits = dev.setdefault("dns_visits", [])
+            if domain not in visits:
+                visits.insert(0, domain)
+            if len(visits) > 500:
+                dev["dns_visits"] = visits[:500]
+            # Add to phone_log as a traffic event
+            ev = {
+                "time":      e["time"],
+                "src":       src_ip,
+                "hostname":  domain,
+                "service":   _domain_to_service(domain),
+                "direction": "OUT",
+                "detail":    f"DNS lookup: {domain}",
+                "port":      53,
+            }
+            pl = dev.setdefault("phone_log", [])
+            pl.insert(0, ev)
+            if len(pl) > 300:
+                dev["phone_log"] = pl[:300]
 
     def add_phone_event(self, mac, direction, service, remote_ip, port, detail=""):
         """Add a traffic event directly to a phone by MAC."""
@@ -831,10 +1138,11 @@ class Scanner:
 
     def start(self):
         self._run = True
-        threading.Thread(target=self._loop_arp,     daemon=True).start()
-        threading.Thread(target=self._loop_traffic, daemon=True).start()
-        threading.Thread(target=self._loop_mdns,    daemon=True).start()
-        threading.Thread(target=self._loop_ssdp,    daemon=True).start()
+        threading.Thread(target=self._loop_arp,       daemon=True).start()
+        threading.Thread(target=self._loop_traffic,   daemon=True).start()
+        threading.Thread(target=self._loop_mdns,      daemon=True).start()
+        threading.Thread(target=self._loop_ssdp,      daemon=True).start()
+        threading.Thread(target=self._dns_sniffer_loop, daemon=True).start()
 
     def stop(self):
         self._run = False
@@ -984,60 +1292,125 @@ class Scanner:
                     return out[0]
         except Exception:
             pass
-        # last resort: assume .1
+        # Method 3: ip route (Linux/Android)
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            my_ip = s.getsockname()[0]
-            s.close()
-            return ".".join(my_ip.split(".")[:3]) + ".1"
+            out = subprocess.check_output(
+                ["ip", "route", "show", "default"],
+                stderr=subprocess.DEVNULL, timeout=3
+            ).decode()
+            m = re.search(r'default via (\d+\.\d+\.\d+\.\d+)', out)
+            if m:
+                return m.group(1)
         except Exception:
-            return "Unknown"
+            pass
+        # Method 4: derive from own IP (fallback)
+        try:
+            my_ip = Scanner.my_ip()
+            if my_ip != "Unknown":
+                return ".".join(my_ip.split(".")[:3]) + ".1"
+        except Exception:
+            pass
+        return "Unknown"
 
     @staticmethod
     def my_ip() -> str:
-        """Return this device's LAN IP address."""
+        """Return this device's LAN IP – 4 fallback methods."""
+        # Method 1: UDP socket trick (most reliable, no data sent)
+        for host in ("8.8.8.8", "1.1.1.1", "208.67.222.222"):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(2)
+                s.connect((host, 80))
+                ip = s.getsockname()[0]
+                s.close()
+                if ip and not ip.startswith("127."):
+                    return ip
+            except Exception:
+                pass
+        # Method 2: Android WifiManager
+        if ANDROID:
+            try:
+                act  = _PythonActivity.mActivity
+                wm   = act.getSystemService(_Context.WIFI_SERVICE)
+                info = wm.getConnectionInfo()
+                raw  = info.getIpAddress()
+                if raw:
+                    return "%d.%d.%d.%d" % (
+                        raw & 0xFF, (raw >> 8) & 0xFF,
+                        (raw >> 16) & 0xFF, (raw >> 24) & 0xFF)
+            except Exception:
+                pass
+        # Method 3: hostname -I (Linux/Android)
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-            return ip
+            out = subprocess.check_output(
+                ["hostname", "-I"], stderr=subprocess.DEVNULL, timeout=3
+            ).decode().strip().split()
+            for ip in out:
+                if re.match(r'(\d+\.){3}\d+', ip) and not ip.startswith("127."):
+                    return ip
         except Exception:
-            return "Unknown"
+            pass
+        # Method 4: ip addr show
+        try:
+            out = subprocess.check_output(
+                ["ip", "addr", "show"], stderr=subprocess.DEVNULL, timeout=3
+            ).decode()
+            for m in re.finditer(r'inet (\d+\.\d+\.\d+\.\d+)', out):
+                ip = m.group(1)
+                if not ip.startswith("127."):
+                    return ip
+        except Exception:
+            pass
+        return "Unknown"
 
     @staticmethod
     def wifi_ssid() -> str:
-        """Return the name of the current WiFi network."""
+        """Return the name of the current WiFi network – 4 fallback methods."""
+        # Method 1: Android WifiManager (most accurate on Android)
+        if ANDROID:
+            try:
+                act  = _PythonActivity.mActivity
+                wm   = act.getSystemService(_Context.WIFI_SERVICE)
+                info = wm.getConnectionInfo()
+                ssid = str(info.getSSID()).strip('"')
+                if ssid and ssid != "<unknown ssid>":
+                    return ssid
+            except Exception:
+                pass
+        # Method 2: Windows netsh
         try:
             if platform.system() == "Windows":
                 out = subprocess.check_output(
                     ["netsh", "wlan", "show", "interfaces"],
-                    stderr=subprocess.DEVNULL
+                    stderr=subprocess.DEVNULL, timeout=5
                 ).decode(errors="ignore")
                 for line in out.splitlines():
                     if "SSID" in line and "BSSID" not in line:
-                        parts = line.split(":", 1)
-                        if len(parts) == 2:
-                            return parts[1].strip()
-            elif platform.system() == "Linux":
-                out = subprocess.check_output(
-                    ["iwgetid", "-r"],
-                    stderr=subprocess.DEVNULL
-                ).decode().strip()
-                if out:
-                    return out
+                        p = line.split(":", 1)
+                        if len(p) == 2 and p[1].strip():
+                            return p[1].strip()
         except Exception:
             pass
-        if ANDROID:
-            try:
-                act = _PythonActivity.mActivity
-                wm  = act.getSystemService(_Context.WIFI_SERVICE)
-                info = wm.getConnectionInfo()
-                ssid = str(info.getSSID()).strip('"')
-                return ssid or "Unknown"
-            except Exception:
-                pass
+        # Method 3: Linux iwgetid
+        try:
+            out = subprocess.check_output(
+                ["iwgetid", "-r"], stderr=subprocess.DEVNULL, timeout=3
+            ).decode().strip()
+            if out:
+                return out
+        except Exception:
+            pass
+        # Method 4: Linux nmcli
+        try:
+            out = subprocess.check_output(
+                ["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
+                stderr=subprocess.DEVNULL, timeout=3
+            ).decode()
+            for line in out.splitlines():
+                if line.startswith("yes:"):
+                    return line[4:].strip()
+        except Exception:
+            pass
         return "Unknown"
 
     @staticmethod
@@ -1142,61 +1515,72 @@ class Scanner:
 
         return "Unknown"
 
-    # ── ARP loop (Method 1 + 2) ──────────────────────────────────────────
+    # ── ARP loop (all methods) ───────────────────────────────────────────
     def _loop_arp(self):
         while self._run:
             try:
-                # Step 1: ping sweep to populate ARP cache before reading it
-                self._ping_sweep()
-                # Step 2: read ARP table (now populated)
-                self._scan_arp()
-                # Step 3: Android extras
+                # Step 1: TCP sweep – forces ARP cache population
+                live_ips = self._tcp_sweep()
+                # CRITICAL: wait 1 s for the OS to populate ARP after TCP probes
+                time.sleep(1.0)
+                # Step 2: read ARP (now populated) + register all devices
+                self._scan_arp(live_ips)
+                # Step 3: Android-specific extras
                 if ANDROID:
                     self._scan_wifi()
                     self._scan_bt()
+                    self._scan_hotspot_clients()
                     self._scan_nsd()
             except Exception:
                 pass
             time.sleep(self.db.setting("scan_interval", 15))
 
-    # ─── Method 2: Active ping sweep ─────────────────────────────────────
-    def _ping_sweep(self):
+    # ─── Method 1: TCP sweep – works on ALL platforms without root ────────
+    def _tcp_sweep(self) -> set:
         """
-        Ping all 254 hosts in the local subnet in parallel.
-        This populates the OS ARP cache so _read_arp() finds devices.
-        Runs fast: 50 threads, 0.5 s timeout each.
+        Probe all 254 hosts in the local subnet via TCP connect.
+        Returns set of IPs that responded (alive).
+        Works on Android without root.
+        All 254 probes run in parallel, max wait = 2 s total.
         """
         my_ip = Scanner.my_ip()
         if my_ip in ("Unknown", ""):
-            return
+            return set()
         parts = my_ip.split(".")
         if len(parts) != 4:
-            return
+            return set()
         subnet = ".".join(parts[:3])
 
+        live = set()
+        lock = threading.Lock()
+        # Ports commonly open on phones, routers, PCs
+        PROBE_PORTS = (80, 443, 8080, 7000, 5353, 22, 8888, 5555,
+                       62078, 7100, 3689, 9090, 445, 139, 135)
+
         def _probe(ip):
-            # ICMP echo via raw socket (works without root on most Android)
-            # Fallback: TCP connect to common ports
+            for port in PROBE_PORTS:
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(0.6)
+                    if s.connect_ex((ip, port)) == 0:
+                        s.close()
+                        with lock:
+                            live.add(ip)
+                        return
+                    s.close()
+                except Exception:
+                    pass
+            # ICMP ping fallback for non-Android
             if not ANDROID:
                 try:
                     sys_name = platform.system()
-                    flag = "-n" if sys_name == "Windows" else "-c"
-                    w_flag = ["-w", "500"] if sys_name == "Windows" else ["-W", "1"]
-                    subprocess.run(
-                        ["ping", flag, "1"] + w_flag + [ip],
-                        capture_output=True, timeout=1.5
-                    )
-                    return
-                except Exception:
-                    pass
-            # TCP fallback (Android + fallback)
-            for port in (80, 443, 8080, 7000, 5353, 22):
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(0.5)
-                    s.connect_ex((ip, port))
-                    s.close()
-                    return
+                    flag  = ["-n", "1"] if sys_name == "Windows" else ["-c", "1"]
+                    wflag = ["-w", "300"] if sys_name == "Windows" else ["-W", "1"]
+                    r = subprocess.run(["ping"] + flag + wflag + [ip],
+                                       capture_output=True, timeout=1.2)
+                    if r.returncode == 0:
+                        with lock:
+                            live.add(ip)
                 except Exception:
                     pass
 
@@ -1204,17 +1588,20 @@ class Scanner:
         for i in range(1, 255):
             ip = f"{subnet}.{i}"
             if ip == my_ip:
+                with lock:
+                    live.add(ip)
                 continue
             t = threading.Thread(target=_probe, args=(ip,), daemon=True)
             threads.append(t)
             t.start()
-            # Limit concurrency: launch in batches of 50
-            if len(threads) >= 50:
-                for t2 in threads:
-                    t2.join(timeout=0.6)
-                threads = []
+
+        # Wait for all (max 2 s total)
+        deadline = time.time() + 2.0
         for t in threads:
-            t.join(timeout=0.6)
+            remaining = max(0, deadline - time.time())
+            t.join(timeout=remaining)
+
+        return live
 
     @staticmethod
     def _is_real_device(ip: str, mac: str) -> bool:
@@ -1252,73 +1639,150 @@ class Scanner:
         except Exception:
             return False
 
-    def _scan_arp(self):
+    def _scan_arp(self, live_ips: set = None):
         """
-        Read ARP table and register ALL discovered LAN devices.
-        Phones are detected via OUI, mDNS names, or port fingerprinting.
-        Unknown-MAC devices are probed via ports to guess type.
+        Register ALL discovered LAN devices.
+        Sources: ARP table + live_ips from TCP sweep + mDNS cache.
+        ALL responding devices are shown; phones are highlighted on radar.
         """
-        for ip, mac in self._read_arp():
-            if not self._is_real_device(ip, mac):
-                continue
+        # Build merged map: ip → mac
+        discovered = {}   # ip → mac
 
-            mfr      = _oui(mac)
-            os_      = _guess_os(mfr)
-            # Try hostname resolution
-            hostname = (self._rssi_name_cache.get(ip)        # from mDNS cache
+        # From ARP table (has MAC info)
+        for ip, mac in self._read_arp():
+            if self._is_real_device(ip, mac):
+                discovered[ip] = mac
+
+        # From TCP sweep (live_ips) — assign MAC from ARP or pseudo-MAC
+        if live_ips:
+            for ip in live_ips:
+                if ip not in discovered and self._is_real_device(ip, "AA:00:00:00:00:01"):
+                    # Try to get real MAC from ARP one more time
+                    real_mac = self._ip_to_mac(ip)
+                    if real_mac:
+                        discovered[ip] = real_mac
+                    else:
+                        # Pseudo-MAC: deterministic from IP so device stays stable
+                        parts = ip.split(".")
+                        discovered[ip] = "FE:FF:{:02X}:{:02X}:{:02X}:{:02X}".format(
+                            int(parts[0]) if len(parts) > 0 else 0,
+                            int(parts[1]) if len(parts) > 1 else 0,
+                            int(parts[2]) if len(parts) > 2 else 0,
+                            int(parts[3]) if len(parts) > 3 else 0,
+                        )
+
+        # From mDNS cache (may have additional IPs)
+        for ip, info in list(self._mdns_cache.items()):
+            if ip not in discovered and self._is_real_device(ip, "AA:00:00:00:00:02"):
+                real_mac = self._ip_to_mac(ip)
+                parts = ip.split(".")
+                discovered[ip] = real_mac or "FD:FE:{:02X}:{:02X}:{:02X}:{:02X}".format(
+                    int(parts[0]) if len(parts) > 0 else 0,
+                    int(parts[1]) if len(parts) > 1 else 0,
+                    int(parts[2]) if len(parts) > 2 else 0,
+                    int(parts[3]) if len(parts) > 3 else 0,
+                )
+
+        for ip, mac in discovered.items():
+            mfr  = _oui(mac)
+            os_  = _guess_os(mfr)
+
+            # ── Enrich from mDNS cache ────────────────────────────────────
+            mdns_info = self._mdns_cache.get(ip, {})
+            if mdns_info.get("name"):
+                name = mdns_info["name"].split(".")[0]
+            else:
+                name = (self._rssi_name_cache.get(ip)
                         or self._hostname(ip)
                         or f"Device-{ip.split('.')[-1]}")
-            name = hostname
+            if mdns_info.get("os"):
+                os_ = mdns_info["os"]
 
-            # ── Phone detection: OUI match OR mDNS name OR port fingerprint
-            dev_stub  = {"manufacturer": mfr, "os": os_, "name": name}
-            is_phone  = _is_phone(dev_stub)
-
-            # Extra: if mDNS cache has phone info, trust it
-            mdns_info = self._mdns_cache.get(ip, {})
+            # ── Classify device type ──────────────────────────────────────
+            dev_stub = {"manufacturer": mfr, "os": os_, "name": name}
             if mdns_info.get("type") == "phone":
-                is_phone = True
-                if mdns_info.get("name"):
-                    name = mdns_info["name"]
-                if mdns_info.get("os"):
-                    os_ = mdns_info["os"]
+                dtype = "phone"
+            elif _is_phone(dev_stub):
+                dtype = "phone"
+            elif _is_camera(dev_stub):
+                dtype = "camera"
+            elif _is_pc(dev_stub):
+                dtype = "pc"
+            elif mfr in _ROUTER_MFRS:
+                dtype = "router"
+            else:
+                # Unknown – use OUI-derived guess, then background port scan
+                dtype = _dtype_from_mfr(mfr) if mfr != "Unknown" else "other"
 
-            # Extra: if MAC is totally unknown, try port fingerprint
-            if not is_phone and mfr == "Unknown":
-                is_phone = self._port_fingerprint_is_phone(ip)
-                if is_phone:
-                    os_ = "Android"   # best guess for unknown phone
+            # Clean up display name for unknown-MAC phones
+            if mfr == "Unknown" and dtype == "phone":
+                mfr = "Phone"
 
-            # Still not a phone? skip (phones only on radar)
-            if not is_phone:
-                continue
-
-            # If manufacturer still unknown but we identified as phone
-            if mfr == "Unknown":
-                mfr = "Phone"   # generic label so it's not "Unknown"
-
-            is_new  = self.db.get(mac) is None
-            signal  = self._rssi_cache.get(ip, -55)
+            is_new = self.db.get(mac) is None
+            signal = self._rssi_cache.get(ip, -55)
             dev = self.db.upsert(
                 mac, ip=ip, name=name, manufacturer=mfr,
-                os=os_, signal=signal, dtype="phone"
+                os=os_, signal=signal, dtype=dtype
             )
+
             if is_new:
-                level = "ALERT" if self.db.setting("alert_new_device") else "INFO"
+                level = ("ALERT" if dtype == "phone"
+                                    and self.db.setting("alert_new_device")
+                         else "INFO")
                 self.db.log(level,
-                            f"Phone detected: {name}  MAC:{mac}  [{mfr} / {os_}]")
-                if self.alert and self.db.setting("alert_new_device"):
+                            f"Device: {name}  [{mfr}/{os_}]  IP:{ip}  MAC:{mac}")
+                if self.alert and dtype == "phone" and self.db.setting("alert_new_device"):
                     is_intruder = self.db.is_intruder(mac)
-                    title   = "INTRUDER ALERT" if is_intruder else "New Phone Detected"
-                    message = (f"Unknown device: {name} [{mfr}]"
-                               if is_intruder
-                               else f"{name}  [{mfr} / {os_}]  IP:{ip}")
+                    title   = "INTRUDER" if is_intruder else "New Phone"
+                    message = f"{name} [{mfr}] IP:{ip}"
                     self.alert.trigger(title, message, mac)
+                # Background port scan + fingerprint for unknown devices
                 threading.Thread(
-                    target=self._port_scan, args=(ip, mac), daemon=True
+                    target=self._classify_and_scan, args=(ip, mac, dtype),
+                    daemon=True
                 ).start()
+
             Clock.schedule_once(lambda dt, d=dev: self.on_device(d), 0)
         self.db.save()
+
+    def _classify_and_scan(self, ip: str, mac: str, current_dtype: str):
+        """
+        Background worker: refine device classification + scan ports.
+        Runs after device is already registered/shown on radar.
+        """
+        # 1. Active multi-method device identification (name, model, OS)
+        self._full_identify(ip, mac)
+
+        # 2. Live OUI lookup for unknown manufacturer
+        dev = self.db.get(mac)
+        if dev and dev.get("manufacturer", "Unknown") == "Unknown":
+            if not mac.startswith(("FE:FF", "FD:FE", "FF:FF")):
+                vendor = _oui_live_lookup(mac)
+                if vendor and vendor != "Unknown":
+                    dev["manufacturer"] = vendor
+                    dev["os"]           = _guess_os(vendor)
+                    new_dtype           = _dtype_from_mfr(vendor)
+                    if new_dtype != "other":
+                        dev["dtype"]    = new_dtype
+                        current_dtype   = new_dtype
+                    self.db.save()
+                    Clock.schedule_once(lambda dt, d=dev: self.on_device(d), 0)
+
+        # 3. Port fingerprint for still-unknown devices
+        if current_dtype == "other":
+            if self._port_fingerprint_is_phone(ip):
+                dev = self.db.get(mac)
+                if dev:
+                    dev["dtype"] = "phone"
+                    if dev.get("manufacturer") in ("Unknown", "Phone", ""):
+                        dev["manufacturer"] = "Phone"
+                    if dev.get("os") == "Unknown":
+                        dev["os"] = "Android"
+                    self.db.save()
+                    Clock.schedule_once(lambda dt, d=dev: self.on_device(d), 0)
+                    return
+        # 4. Full port scan
+        self._port_scan(ip, mac)
 
     def _port_fingerprint_is_phone(self, ip: str) -> bool:
         """
@@ -1380,36 +1844,327 @@ class Scanner:
                     lambda dt, d=dev: self.on_device(d), 0)
 
     def _read_arp(self):
-        rows = []
+        """
+        Read ARP cache using 3 methods in parallel for maximum coverage.
+        Method A: /proc/net/arp  (Linux / Android)
+        Method B: ip neigh show  (Linux / Android, may have more entries)
+        Method C: arp -a         (Windows / macOS / some Android)
+        """
+        seen = {}  # ip → mac  (deduplicated)
+
+        # ── Method A: /proc/net/arp ──────────────────────────────────
         try:
-            if platform.system() == "Windows":
-                out = subprocess.check_output(
-                    "arp -a", shell=True,
-                    stderr=subprocess.DEVNULL
-                ).decode(errors="ignore")
-                for line in out.splitlines():
-                    m = re.search(
-                        r'(\d+\.\d+\.\d+\.\d+)\s+([\da-f\-]{17})', line, re.I)
-                    if m:
-                        rows.append((
-                            m.group(1),
-                            m.group(2).replace("-", ":").upper()
-                        ))
-            else:
-                with open("/proc/net/arp") as f:
-                    for line in f.readlines()[1:]:
-                        p = line.split()
-                        if len(p) >= 4 and p[3] != "00:00:00:00:00:00":
-                            rows.append((p[0], p[3].upper()))
+            with open("/proc/net/arp") as f:
+                for line in f.readlines()[1:]:
+                    p = line.split()
+                    if len(p) >= 4 and p[3] not in ("00:00:00:00:00:00", ""):
+                        seen[p[0]] = p[3].upper()
         except Exception:
             pass
-        return rows
 
-    def _hostname(self, ip):
+        # ── Method B: ip neigh show ──────────────────────────────────
+        try:
+            out = subprocess.check_output(
+                ["ip", "neigh", "show"],
+                stderr=subprocess.DEVNULL, timeout=3
+            ).decode(errors="ignore")
+            for line in out.splitlines():
+                # format: <ip> dev <iface> lladdr <mac> <state>
+                m = re.search(
+                    r'(\d+\.\d+\.\d+\.\d+).*lladdr\s+([\da-f:]{17})', line, re.I)
+                if m:
+                    ip, mac = m.group(1), m.group(2).upper()
+                    if mac != "00:00:00:00:00:00":
+                        seen[ip] = mac
+        except Exception:
+            pass
+
+        # ── Method C: arp -a ─────────────────────────────────────────
+        try:
+            out = subprocess.check_output(
+                "arp -a", shell=True, stderr=subprocess.DEVNULL, timeout=4
+            ).decode(errors="ignore")
+            for line in out.splitlines():
+                m = re.search(
+                    r'(\d+\.\d+\.\d+\.\d+)\s+([\da-f\-:]{17})', line, re.I)
+                if m:
+                    ip  = m.group(1)
+                    mac = m.group(2).replace("-", ":").upper()
+                    if mac not in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"):
+                        seen.setdefault(ip, mac)
+        except Exception:
+            pass
+
+        return list(seen.items())
+
+    def _hostname(self, ip: str):
         try:
             return socket.gethostbyaddr(ip)[0].split(".")[0]
         except Exception:
             return None
+
+    # ── Active device-name discovery (no OUI DB needed) ──────────────────────
+
+    def _netbios_name(self, ip: str, timeout: float = 0.8) -> str:
+        """
+        Query NetBIOS node status (UDP 137).
+        Works on Windows PCs, Android (some), and network printers.
+        """
+        try:
+            # NBSTAT request: transaction ID 0xABCD, flags 0x0000, 1 question
+            req = (b'\xab\xcd\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+                   b'\x20'
+                   b'CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+                   b'\x00\x00\x21\x00\x01')
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            sock.sendto(req, (ip, 137))
+            data = sock.recv(1024)
+            sock.close()
+            if len(data) > 57:
+                num  = data[56]
+                if num > 0:
+                    raw  = data[57:57 + 15].decode('ascii', errors='ignore').strip()
+                    name = raw.split('\x00')[0].strip()
+                    if name and not name.startswith('*'):
+                        return name
+        except Exception:
+            pass
+        return ""
+
+    def _mdns_device_info(self, ip: str, timeout: float = 1.0) -> dict:
+        """
+        Send targeted mDNS queries to a specific host to get:
+          - device name (_device-info._tcp.local → TXT → model)
+          - Apple model (records in cache)
+          - hostname from PTR
+        Returns dict with keys: name, model, os
+        """
+        result = {}
+        try:
+            import struct as _s
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.settimeout(timeout)
+            # Query: PTR _device-info._tcp.local
+            def _mdns_query(qname: str) -> bytes:
+                parts = qname.encode().split(b'.')
+                labels = b''.join(bytes([len(p)]) + p for p in parts) + b'\x00'
+                return b'\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00' + labels + b'\x00\x0c\x00\x01'
+            sock.sendto(_mdns_query('_device-info._tcp.local'),
+                        ('224.0.0.251', 5353))
+            try:
+                data, addr = sock.recvfrom(4096)
+                if addr[0] == ip and len(data) > 12:
+                    txt = data[12:].decode('utf-8', errors='ignore')
+                    if 'model=' in txt.lower():
+                        idx = txt.lower().index('model=') + 6
+                        model = txt[idx:idx+40].split('\x00')[0].strip()
+                        if model:
+                            result['model'] = model
+            except Exception:
+                pass
+            sock.close()
+        except Exception:
+            pass
+        return result
+
+    def _http_identify(self, ip: str, timeout: float = 1.5) -> dict:
+        """
+        Grab HTTP Server header + HTML title from port 80 / 8080 / 8888.
+        Many routers, IP cameras, smart TVs, and Android debug servers
+        expose device info this way.
+        """
+        result = {}
+        for port in (80, 8080, 8888, 7080):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                s.connect((ip, port))
+                s.sendall(
+                    f"GET / HTTP/1.0\r\nHost: {ip}\r\n\r\n".encode()
+                )
+                raw = s.recv(3072).decode('utf-8', errors='ignore')
+                s.close()
+                for line in raw.split('\r\n'):
+                    ll = line.lower()
+                    if ll.startswith('server:'):
+                        result['server'] = line[7:].strip()
+                    if ll.startswith('x-device-name:') or ll.startswith('x-model:'):
+                        key = ll.split(':')[0].replace('x-','').replace('-','_')
+                        result[key] = line.split(':',1)[1].strip()
+                # Try HTML <title>
+                if '<title>' in raw.lower():
+                    start = raw.lower().index('<title>') + 7
+                    end   = raw.lower().index('</title>', start) if '</title>' in raw.lower() else start+60
+                    title = raw[start:end].strip()[:50]
+                    if title and not any(x in title.lower() for x in
+                                         ('error','404','403','index','welcome','default')):
+                        result['title'] = title
+                if result:
+                    result['port'] = port
+                    break
+            except Exception:
+                pass
+        return result
+
+    def _snmp_sysname(self, ip: str, timeout: float = 0.8) -> str:
+        """
+        SNMP v1 GET for sysDescr (OID 1.3.6.1.2.1.1.1.0) and
+        sysName (OID 1.3.6.1.2.1.1.5.0).
+        Works on routers, some Android devices, printers.
+        """
+        def _build_get(oid_bytes: bytes) -> bytes:
+            # Minimal SNMPv1 GetRequest
+            oid    = b'\x06' + bytes([len(oid_bytes)]) + oid_bytes
+            varbind= b'\x30' + bytes([len(oid)+2]) + oid + b'\x05\x00'
+            varlist= b'\x30' + bytes([len(varbind)]) + varbind
+            pdu    = b'\xa0' + bytes([4+len(varlist)]) + b'\x02\x01\x00\x02\x01\x00' + varlist
+            community= b'\x04\x06public'
+            msg    = community + b'\x02\x01\x00' + pdu
+            return  b'\x30' + bytes([len(msg)]) + msg
+        _SYSDESCR = b'\x2b\x06\x01\x02\x01\x01\x01\x00'
+        _SYSNAME  = b'\x2b\x06\x01\x02\x01\x01\x05\x00'
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            sock.sendto(_build_get(_SYSNAME), (ip, 161))
+            data = sock.recv(512)
+            sock.close()
+            raw = data.decode('latin-1', errors='replace')
+            # Find printable string after the OID
+            for i in range(len(raw)-2, 0, -1):
+                if raw[i] == '\x04':
+                    slen = ord(raw[i+1])
+                    name = raw[i+2:i+2+slen].strip()
+                    if name and all(31 < ord(c) < 127 for c in name[:10]):
+                        return name[:40]
+        except Exception:
+            pass
+        return ""
+
+    def _dhcp_hostname(self, ip: str) -> str:
+        """
+        Check common DHCP lease files for hostname associated with IP.
+        Works on Linux, OpenWRT, and Android hotspot mode.
+        """
+        lease_files = [
+            '/var/lib/misc/dnsmasq.leases',
+            '/data/misc/dhcp/dnsmasq.leases',
+            '/tmp/dhcp.leases',
+            '/var/lib/dhcp/dhcpd.leases',
+            '/tmp/dnsmasq.leases',
+        ]
+        for path in lease_files:
+            try:
+                with open(path, 'r', errors='ignore') as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 4 and parts[2] == ip:
+                            name = parts[3].strip()
+                            if name and name != '*':
+                                return name
+            except Exception:
+                pass
+        return ""
+
+    def _full_identify(self, ip: str, mac: str):
+        """
+        Run all identification methods in parallel for a single device.
+        Updates the device record with the best available name/model/os.
+        Called from _classify_and_scan background thread.
+        """
+        import concurrent.futures as _cf
+
+        dev = self.db.get(mac)
+        if not dev:
+            return
+
+        current_name = dev.get('name', '')
+        # Skip if already well-identified
+        if (current_name and
+                not current_name.startswith('Device-') and
+                current_name not in ('Unknown', '', 'Phone')):
+            return
+
+        results = {}
+        with _cf.ThreadPoolExecutor(max_workers=5) as ex:
+            f_nb   = ex.submit(self._netbios_name,    ip)
+            f_dhcp = ex.submit(self._dhcp_hostname,   ip)
+            f_http = ex.submit(self._http_identify,   ip)
+            f_mdns = ex.submit(self._mdns_device_info,ip)
+            f_snmp = ex.submit(self._snmp_sysname,    ip)
+
+            results['netbios'] = f_nb.result()
+            results['dhcp']    = f_dhcp.result()
+            results['http']    = f_http.result()
+            results['mdns']    = f_mdns.result()
+            results['snmp']    = f_snmp.result()
+
+        # ── Pick best name ────────────────────────────────────────
+        best_name  = ""
+        best_model = ""
+        best_os    = ""
+
+        if results['netbios']:
+            best_name = results['netbios']
+
+        if results['dhcp'] and not best_name:
+            best_name = results['dhcp']
+
+        if results['snmp'] and not best_name:
+            best_name = results['snmp']
+
+        http = results['http']
+        if http:
+            if http.get('title') and not best_name:
+                best_name = http['title']
+            if http.get('server'):
+                srv = http['server']
+                # Try to infer manufacturer from server string
+                for brand in ('Hikvision','Dahua','Axis','TP-Link','Huawei',
+                              'Samsung','Sony','Canon','Epson','Cisco'):
+                    if brand.lower() in srv.lower():
+                        if dev.get('manufacturer','Unknown') == 'Unknown':
+                            dev['manufacturer'] = brand
+                            dev['os']           = _guess_os(brand)
+                            dev['dtype']        = _dtype_from_mfr(brand)
+                        break
+
+        mdns = results['mdns']
+        if mdns.get('model'):
+            best_model = mdns['model']
+            # Map Apple model codes → human names
+            _apple_models = {
+                'iPhone': 'iPhone', 'iPad': 'iPad', 'MacBook': 'MacBook',
+                'iMac': 'iMac', 'AppleTV': 'Apple TV', 'HomePod': 'HomePod',
+                'Watch': 'Apple Watch', 'iPod': 'iPod',
+            }
+            for code, human in _apple_models.items():
+                if code.lower() in best_model.lower():
+                    best_os = 'iOS/macOS'
+                    if dev.get('manufacturer','Unknown') == 'Unknown':
+                        dev['manufacturer'] = 'Apple'
+                    if not best_name:
+                        best_name = human
+                    break
+
+        # ── Apply updates to DB ───────────────────────────────────
+        changed = False
+        if best_name and (not dev.get('name') or
+                          dev['name'].startswith('Device-')):
+            dev['name'] = best_name
+            changed = True
+        if best_model:
+            dev['model'] = best_model
+            changed = True
+        if best_os and dev.get('os','Unknown') == 'Unknown':
+            dev['os'] = best_os
+            changed = True
+
+        if changed:
+            self.db.save()
+            Clock.schedule_once(lambda dt, d=dev: self.on_device(d), 0)
 
     def _scan_wifi(self):
         """
@@ -1450,6 +2205,67 @@ class Scanner:
         except Exception:
             pass
 
+    def _scan_hotspot_clients(self):
+        """
+        Detect phones connected to THIS device's WiFi hotspot.
+        Reads /proc/net/arp (populated by Android when hotspot is active)
+        and /data/misc/dhcp/dnsmasq.leases (root) or
+        /data/misc/apf/dnsmasq.leases (newer Android).
+        No root: still gets entries from ARP + /proc/net/arp which Android
+        populates automatically for hotspot clients.
+        """
+        # Method A: Read DHCP lease files (may work on some Android versions)
+        lease_files = [
+            "/data/misc/dhcp/dnsmasq.leases",
+            "/data/misc/apf/dnsmasq.leases",
+            "/data/misc/dhcp/dnsmasq-l2t.leases",
+        ]
+        for lf in lease_files:
+            try:
+                with open(lf) as f:
+                    for line in f:
+                        # format: <timestamp> <mac> <ip> <hostname> *
+                        parts = line.strip().split()
+                        if len(parts) >= 3:
+                            mac  = parts[1].upper()
+                            ip   = parts[2]
+                            name = parts[3] if len(parts) > 3 else f"Device-{ip.split('.')[-1]}"
+                            if name == "*":
+                                name = f"Device-{ip.split('.')[-1]}"
+                            if not self._is_real_device(ip, mac):
+                                continue
+                            mfr  = _oui(mac)
+                            os_  = _guess_os(mfr)
+                            dev  = self.db.upsert(
+                                mac, ip=ip, name=name, manufacturer=mfr,
+                                os=os_, signal=-60, dtype="phone" if _is_phone(
+                                    {"manufacturer": mfr, "os": os_}) else "other"
+                            )
+                            Clock.schedule_once(lambda dt, d=dev: self.on_device(d), 0)
+            except Exception:
+                pass
+
+        # Method B: /proc/net/arp entries with src_ip in hotspot subnet (192.168.43.x)
+        # Android hotspot default subnet is 192.168.43.0/24
+        try:
+            my_ip = Scanner.my_ip()
+            if my_ip.startswith("192.168.43."):
+                # This device IS a hotspot; all ARP entries are clients
+                for ip, mac in self._read_arp():
+                    if ip == my_ip:
+                        continue
+                    if ip.startswith("192.168.43.") and self._is_real_device(ip, mac):
+                        mfr = _oui(mac)
+                        os_ = _guess_os(mfr)
+                        dev = self.db.upsert(
+                            mac, ip=ip,
+                            name=self._hostname(ip) or f"Hotspot-Client-{ip.split('.')[-1]}",
+                            manufacturer=mfr, os=os_, signal=-50, dtype="phone"
+                        )
+                        Clock.schedule_once(lambda dt, d=dev: self.on_device(d), 0)
+        except Exception:
+            pass
+
     def _scan_nsd(self):
         """
         Android NSD (Network Service Discovery) – discovers services on LAN.
@@ -1457,7 +2273,6 @@ class Scanner:
         Works without root on Android 6+.
         """
         try:
-            # Use multicast socket to send mDNS query
             self._scan_mdns()
         except Exception:
             pass
@@ -1734,6 +2549,176 @@ class Scanner:
                 pass
 
     # ── TCP traffic loop ─────────────────────────────────────────────────
+    # ── DNS monitoring (passive sniffer + active proxy) ──────────────────────
+
+    @staticmethod
+    def _parse_dns_packet(data: bytes) -> tuple:
+        """
+        Parse a raw DNS UDP packet.
+        Returns (src_is_query: bool, questions: list[str], answers: list[str])
+        """
+        questions, answers = [], []
+        try:
+            if len(data) < 12:
+                return False, [], []
+            flags    = (data[2] << 8) | data[3]
+            is_query = (flags & 0x8000) == 0
+            qdcount  = (data[4] << 8) | data[5]
+            ancount  = (data[6] << 8) | data[7]
+
+            def _read_name(buf: bytes, off: int) -> tuple:
+                labels, visited = [], set()
+                while off < len(buf):
+                    if off in visited:
+                        break
+                    visited.add(off)
+                    ln = buf[off]
+                    if ln == 0:
+                        off += 1
+                        break
+                    if (ln & 0xC0) == 0xC0:   # pointer
+                        ptr = ((ln & 0x3F) << 8) | buf[off + 1]
+                        name_part, _ = _read_name(buf, ptr)
+                        labels.append(name_part)
+                        off += 2
+                        break
+                    off += 1
+                    labels.append(buf[off:off + ln].decode('ascii', errors='ignore'))
+                    off += ln
+                return '.'.join(labels), off
+
+            off = 12
+            for _ in range(qdcount):
+                name, off = _read_name(data, off)
+                off += 4   # skip QTYPE + QCLASS
+                if name:
+                    questions.append(name)
+
+            for _ in range(ancount):
+                _, off = _read_name(data, off)
+                rtype  = (data[off] << 8) | data[off + 1]
+                off   += 8   # type + class + TTL
+                rdlen  = (data[off] << 8) | data[off + 1]
+                off   += 2
+                if rtype == 1 and rdlen == 4:   # A record
+                    ip_str = '.'.join(str(b) for b in data[off:off + 4])
+                    answers.append(ip_str)
+                elif rtype == 5:                # CNAME
+                    cname, _ = _read_name(data, off)
+                    answers.append(cname)
+                off += rdlen
+        except Exception:
+            pass
+        return not is_query if 'is_query' in dir() else False, questions, answers
+
+    def _dns_sniffer_loop(self):
+        """
+        Passive DNS capture — two complementary methods:
+
+        Method A (mDNS multicast 224.0.0.251:5353) — no root, no config needed.
+          Captures all .local lookups + inter-device mDNS queries.
+
+        Method B (DNS proxy on port 5300 or 53) — optional.
+          When the router's DHCP is set to give out our IP as DNS server,
+          ALL DNS queries from ALL devices flow through here and are logged.
+          Falls back to port 5300 if port 53 is in use.
+        """
+        import struct as _st
+
+        # ── Method A: mDNS multicast listener ──────────────────────
+        def _mdns_listen():
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM,
+                                     socket.IPPROTO_UDP)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET,
+                                    socket.SO_REUSEPORT, 1)
+                except AttributeError:
+                    pass
+                sock.bind(('', 5353))
+                mreq = _st.pack('4sL',
+                                socket.inet_aton('224.0.0.251'),
+                                socket.INADDR_ANY)
+                sock.setsockopt(socket.IPPROTO_IP,
+                                socket.IP_ADD_MEMBERSHIP, mreq)
+                sock.settimeout(2.0)
+                while self._run:
+                    try:
+                        data, addr = sock.recvfrom(4096)
+                        src_ip = addr[0]
+                        _, questions, _ = self._parse_dns_packet(data)
+                        for q in questions:
+                            self.db.add_dns_event(src_ip, q, 'mDNS')
+                    except socket.timeout:
+                        pass
+                    except Exception:
+                        pass
+                sock.close()
+            except Exception:
+                pass
+
+        # ── Method B: DNS proxy server ──────────────────────────────
+        def _dns_proxy():
+            upstream = ('8.8.8.8', 53)
+            for port in (53, 5353, 5300):
+                try:
+                    srv = socket.socket(socket.AF_INET,
+                                        socket.SOCK_DGRAM)
+                    srv.setsockopt(socket.SOL_SOCKET,
+                                   socket.SO_REUSEADDR, 1)
+                    srv.bind(('', port))
+                    self._dns_proxy_port = port
+                    self.db.log("INFO",
+                                f"DNS proxy active on port {port} — "
+                                "point devices to this IP for full DNS logging")
+                    srv.settimeout(2.0)
+                    break
+                except Exception:
+                    srv = None
+                    continue
+
+            if not srv:
+                return
+
+            fwd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            fwd.settimeout(3.0)
+
+            while self._run:
+                try:
+                    data, client = srv.recvfrom(4096)
+                    src_ip = client[0]
+                    # Parse query
+                    _, questions, _ = self._parse_dns_packet(data)
+                    for q in questions:
+                        if q:
+                            svc = _domain_to_service(q)
+                            self.db.add_dns_event(src_ip, q, 'DNS')
+                            # Also tag matching device
+                            dev = self.db._find_by_ip(src_ip)
+                            if dev and _is_phone(dev):
+                                svcs = dev.setdefault('services', [])
+                                if svc not in svcs:
+                                    svcs.insert(0, svc)
+                                    if len(svcs) > 30:
+                                        dev['services'] = svcs[:30]
+                    # Forward to real DNS
+                    try:
+                        fwd.sendto(data, upstream)
+                        resp, _ = fwd.recvfrom(4096)
+                        srv.sendto(resp, client)
+                    except Exception:
+                        pass
+                except socket.timeout:
+                    pass
+                except Exception:
+                    pass
+            srv.close()
+            fwd.close()
+
+        threading.Thread(target=_mdns_listen, daemon=True).start()
+        threading.Thread(target=_dns_proxy,   daemon=True).start()
+
     def _loop_traffic(self):
         while self._run:
             try:
@@ -1808,8 +2793,10 @@ class Scanner:
         return f"Connection on port {port}"
 
     def _read_tcp(self):
-        """Read ESTABLISHED TCP connections; return (local_ip, remote_ip, port, direction)."""
+        """Read ESTABLISHED TCP connections – 2 methods for max coverage."""
         rows = []
+
+        # ── Method A: /proc/net/tcp  (Linux / Android) ───────────────
         for fname in ("/proc/net/tcp", "/proc/net/tcp6"):
             try:
                 with open(fname) as f:
@@ -1818,7 +2805,7 @@ class Scanner:
                         if len(p) < 4:
                             continue
                         state = int(p[3], 16)
-                        if state != 1:
+                        if state != 1:   # 1 = ESTABLISHED
                             continue
                         local_hex   = p[1]
                         remote_hex  = p[2]
@@ -1828,19 +2815,41 @@ class Scanner:
                         remote_port = int(remote_hex.split(":")[1], 16)
                         if remote_ip in ("0.0.0.0", "127.0.0.1"):
                             continue
-                        # direction: if remote port is well-known → OUT (we connected)
-                        #            if local port is well-known  → IN  (they connected)
-                        if remote_port < 1024 or remote_port in (
-                            5222, 5228, 5353, 8080, 8443, 19305
-                        ):
-                            direction = "OUT"
-                        elif local_port < 1024:
-                            direction = "IN"
-                        else:
-                            direction = "OUT"
+                        direction = ("OUT" if remote_port < 1024
+                                             or remote_port in
+                                             (5222, 5228, 5353, 8080, 8443, 19305)
+                                     else ("IN" if local_port < 1024 else "OUT"))
                         rows.append((local_ip, remote_ip, remote_port, direction))
             except Exception:
                 pass
+
+        # ── Method B: netstat -ano  (Windows) ────────────────────────
+        if platform.system() == "Windows" and not rows:
+            try:
+                out = subprocess.check_output(
+                    ["netstat", "-ano"], stderr=subprocess.DEVNULL, timeout=5
+                ).decode(errors="ignore")
+                for line in out.splitlines():
+                    p = line.split()
+                    if len(p) < 4:
+                        continue
+                    if "ESTABLISHED" not in p:
+                        continue
+                    local_addr  = p[1]
+                    remote_addr = p[2]
+                    # addr format: ip:port
+                    def _split(addr):
+                        parts = addr.rsplit(":", 1)
+                        return (parts[0].strip("[]"), int(parts[1])) if len(parts) == 2 else ("", 0)
+                    local_ip, local_port   = _split(local_addr)
+                    remote_ip, remote_port = _split(remote_addr)
+                    if not remote_ip or remote_ip in ("0.0.0.0", "127.0.0.1", "::1"):
+                        continue
+                    direction = "OUT" if remote_port < 1024 else "OUT"
+                    rows.append((local_ip, remote_ip, remote_port, direction))
+            except Exception:
+                pass
+
         return rows
 
 
@@ -2003,21 +3012,24 @@ class RadarWidget(Widget):
                 alpha = max(alpha, pulse)
                 col   = RED[:3]
 
-            # ── outer glow (largest, most transparent) ────────────────
-            sg = dp(22)
-            cgo.rgba = (*col, alpha * 0.12)
+            # Size multiplier: phones/routers bigger, others smaller
+            sz_mult = 1.0 if dtype == "phone" else (0.8 if dtype == "router" else 0.6)
+
+            # ── outer glow ───────────────────────────────────────────
+            sg = dp(22) * sz_mult
+            cgo.rgba = (*col, alpha * (0.18 if dtype == "phone" else 0.10))
             ego.pos  = (bx - sg/2, by - sg/2)
             ego.size = (sg, sg)
 
             # ── mid glow ─────────────────────────────────────────────
-            sm = dp(13)
-            cgm.rgba = (*col, alpha * 0.30)
+            sm = dp(14) * sz_mult
+            cgm.rgba = (*col, alpha * (0.38 if dtype == "phone" else 0.22))
             egm.pos  = (bx - sm/2, by - sm/2)
             egm.size = (sm, sm)
 
             # ── core dot ─────────────────────────────────────────────
-            sd = dp(7)
-            c_dot.rgba = (*col, min(1.0, alpha + 0.15))
+            sd = dp(8) * sz_mult if dtype == "phone" else dp(5)
+            c_dot.rgba = (*col, min(1.0, alpha + (0.20 if dtype == "phone" else 0.05)))
             e_dot.pos  = (bx - sd/2, by - sd/2)
             e_dot.size = (sd, sd)
 
@@ -2120,6 +3132,59 @@ class RadarWidget(Widget):
 
 
 # ─── Shared UI helpers ────────────────────────────────────────────────────────
+def _signal_bars(rssi) -> str:
+    """Convert RSSI dBm to visual bar string."""
+    try:
+        v = int(rssi)
+    except (TypeError, ValueError):
+        return "----"
+    if v >= -50:  return "[||||]"
+    if v >= -60:  return "[|||·]"
+    if v >= -70:  return "[||··]"
+    if v >= -80:  return "[|···]"
+    return                "[····]"
+
+def _signal_color(rssi) -> tuple:
+    try:
+        v = int(rssi)
+    except (TypeError, ValueError):
+        return G3
+    if v >= -55: return G1
+    if v >= -70: return YEL
+    return RED
+
+def _brand_sym(mfr: str, dtype: str) -> tuple:
+    """Return (symbol, color, label) for a manufacturer/dtype."""
+    m = {
+        "Apple":   ("[A]",   WHT, "iPhone"),
+        "Samsung": ("[S]",   (0.20,0.55,1.00,1), "Samsung"),
+        "Xiaomi":  ("[Mi]",  (1.00,0.35,0.05,1), "Xiaomi"),
+        "Redmi":   ("[Mi]",  (1.00,0.35,0.05,1), "Redmi"),
+        "POCO":    ("[Mi]",  (1.00,0.35,0.05,1), "POCO"),
+        "Infinix": ("[IX]",  (0.20,0.80,0.40,1), "Infinix"),
+        "Tecno":   ("[TC]",  (0.20,0.80,0.40,1), "Tecno"),
+        "Itel":    ("[IT]",  (0.20,0.80,0.40,1), "Itel"),
+        "Huawei":  ("[HW]",  (0.80,0.10,0.10,1), "Huawei"),
+        "Honor":   ("[H]",   (0.80,0.10,0.10,1), "Honor"),
+        "OnePlus": ("[1+]",  (1.00,0.30,0.05,1), "OnePlus"),
+        "OPPO":    ("[OP]",  (0.00,0.70,0.60,1), "OPPO"),
+        "Realme":  ("[RL]",  (1.00,0.55,0.00,1), "Realme"),
+        "Vivo":    ("[V]",   (0.20,0.40,1.00,1), "Vivo"),
+        "Google":  ("[G]",   (0.20,0.55,1.00,1), "Pixel"),
+        "Nokia":   ("[N]",   (0.00,0.50,0.80,1), "Nokia"),
+        "Motorola":("[Mo]",  (0.70,0.20,0.80,1), "Motorola"),
+        "LG":      ("[LG]",  (0.80,0.05,0.20,1), "LG"),
+        "Sony":    ("[So]",  (0.05,0.10,0.60,1), "Sony"),
+        "Lenovo":  ("[Le]",  (0.80,0.10,0.10,1), "Lenovo"),
+    }.get(mfr)
+    if m:
+        return m
+    if dtype == "phone":   return ("[D]",  G1,  "Android")
+    if dtype == "camera":  return ("[CAM]",CYN, "Camera")
+    if dtype == "pc":      return ("[PC]", (0.60,0.80,1.00,1), "PC")
+    if dtype == "router":  return ("[RT]", YEL, "Router")
+    return ("[?]", G3, "Device")
+
 def _lbl(text, size=11, color=G2, bold=False, halign='left', **kwargs):
     lb = Label(text=str(text), font_size=sp(size), color=color,
                bold=bold, halign=halign, valign='middle', **kwargs)
@@ -2203,39 +3268,42 @@ class RadarScreen(BaseScreen):
         hud_row.add_widget(self._hud)
         self.root_box.add_widget(hud_row)
 
+    def on_pre_enter(self, *args):
+        """Re-request permissions every time radar screen is opened."""
+        if ANDROID:
+            _request_android_permissions()
+
     def on_device(self, dev):
-        # Show on radar: phones + any device explicitly typed as phone
-        if not (_is_phone(dev) or dev.get('dtype') == 'phone'):
-            return
-        mac = dev['mac']
-        self.radar.set_device(
-            dev,
-            threat      = self.db.is_blocked(mac),
-            is_intruder = self.db.is_intruder(mac)
-        )
+        # Only show PHONES on radar
+        mac    = dev['mac']
+        is_phn = _is_phone(dev)
+        if is_phn:
+            self.radar.set_device(
+                dev,
+                threat      = self.db.is_blocked(mac),
+                is_intruder = self.db.is_intruder(mac)
+            )
         phones    = [d for d in self.db.active() if _is_phone(d)]
         intruders = [d for d in phones if self.db.is_intruder(d['mac'])]
-        mfr       = dev.get('manufacturer', '?')
-        os_       = dev.get('os', '?')
-        sig       = dev.get('signal', '?')
-        alert_txt = f"  [!] {len(intruders)} INTRUDER(S)" if intruders else ""
+        mfr = dev.get('manufacturer', '?')
+        sig = dev.get('signal', '?')
+        alert_txt = f"  !! {len(intruders)} INTRUDER" if intruders else ""
         self._hud.text = (
-            f"PHONES: {len(phones)}  |  "
-            f"LAST: {dev.get('name','?')} [{mfr}/{os_}] RSSI:{sig}dBm"
+            f"PHONES: {len(phones)}  "
+            f"LAST: {dev.get('name','?')} [{mfr}] {sig}dBm"
             f"{alert_txt}"
         )
-        if intruders:
-            self._hud.color = RED
-        else:
-            self._hud.color = G2
+        self._hud.color = RED if intruders else G2
 
 
 # ─── Devices Screen ───────────────────────────────────────────────────────────
 class DeviceRow(BoxLayout):
-    def __init__(self, dev, db, on_block, on_trust=None, **kwargs):
+    def __init__(self, dev, db, on_block, on_trust=None, on_tap=None, **kwargs):
         super().__init__(orientation='horizontal', size_hint_y=None,
                          spacing=dp(8), padding=[dp(10), dp(8)], **kwargs)
         _card(self)
+        self._dev    = dev
+        self._on_tap = on_tap
         mac      = dev['mac']
         mfr      = dev.get('manufacturer', 'Unknown')
         os_      = dev.get('os', 'Unknown')
@@ -2250,78 +3318,94 @@ class DeviceRow(BoxLayout):
         self.size_hint_y = None
         self.height      = h
 
-        # ── icon column ──────────────────────────────────────────────
+        dtype      = dev.get('dtype', 'other')
+        ip         = dev.get('ip', '?')
+        sig        = dev.get('signal', None)
+        last_seen  = str(dev.get('last_seen', ''))[:16]
+        sym, sym_col, type_lbl = _brand_sym(mfr, dtype)
+
+        # ── dynamic card height ───────────────────────────────────────
+        n_rows = 3 + (1 if ports or svcs else 0)
+        h = dp(16) * n_rows + dp(32)
+        self.size_hint_y = None
+        self.height = max(h, dp(88))
+
+        # ── LEFT: brand icon block ────────────────────────────────────
         icon_col = BoxLayout(orientation='vertical',
-                             size_hint_x=None, width=dp(44),
-                             padding=[0, dp(4)])
-        sym = "[A]" if mfr == "Apple" else "[D]"
-        icon_col.add_widget(_lbl(sym, size=14,
-                                 color=WHT if mfr == "Apple" else G1,
-                                 halign='center'))
-        icon_col.add_widget(_lbl(
-            "iOS" if os_ == "iOS/macOS" else "Droid",
-            size=8, color=G3, halign='center'))
-        # trust badge
-        badge_txt   = "[OK]"  if trusted  else ("[!!]" if intruder else "")
-        badge_color = G1      if trusted  else (RED    if intruder else G3)
-        if badge_txt:
-            icon_col.add_widget(_lbl(badge_txt, size=9,
-                                     color=badge_color, halign='center', bold=True))
+                             size_hint_x=None, width=dp(52),
+                             padding=[dp(2), dp(6)], spacing=dp(2))
+        sym_lbl = _lbl(sym, size=15, color=sym_col, bold=True, halign='center')
+        type_lb = _lbl(type_lbl, size=7, color=sym_col, halign='center')
+        icon_col.add_widget(sym_lbl)
+        icon_col.add_widget(type_lb)
 
-        # ── info column ──────────────────────────────────────────────
-        info = BoxLayout(orientation='vertical', spacing=dp(2))
+        if trusted:
+            icon_col.add_widget(_lbl("[OK]", size=8, color=G1,
+                                     halign='center', bold=True))
+        elif intruder:
+            icon_col.add_widget(_lbl("[!!]", size=8, color=RED,
+                                     halign='center', bold=True))
 
-        # row 1: name (red if blocked / intruder, green if trusted)
-        name_color = (RED if (blocked or intruder) else
-                      (G1  if trusted              else G1))
-        name_prefix = "[INTRUDER] " if intruder else ("[BLOCKED] " if blocked else "")
-        info.add_widget(_lbl(
-            name_prefix + dev.get('name', 'Unknown'),
-            size=14, color=name_color, bold=True))
+        # ── CENTER: info block ────────────────────────────────────────
+        info = BoxLayout(orientation='vertical', spacing=dp(1),
+                         padding=[0, dp(6), 0, dp(4)])
 
-        info.add_widget(_lbl(
-            f"{mfr}  |  {os_}  |  MAC: {mac}",
-            size=9, color=G2))
+        # Row 1: device name + status dot
+        name_row = BoxLayout(size_hint_y=None, height=dp(22))
+        name_str  = dev.get('name', 'Unknown')
+        if intruder:   name_str = "[!] " + name_str
+        elif blocked:  name_str = "[X] " + name_str
+        name_col = (RED if (blocked or intruder) else G1)
+        name_row.add_widget(_lbl(name_str, size=13, color=name_col, bold=True))
+        info.add_widget(name_row)
 
-        first = str(dev.get('first_seen', ''))[:16]
-        last  = str(dev.get('last_seen',  ''))[:16]
-        info.add_widget(_lbl(
-            f"IP: {dev.get('ip','?')}  |  RSSI: {dev.get('signal','?')}dBm  |"
-            f"  First: {first}  Last: {last}",
-            size=8, color=G3))
+        # Row 2: brand / model / OS
+        model_str = dev.get('model', '')
+        row2_txt  = f"{mfr}  ·  {model_str}" if model_str else f"{mfr}  ·  {os_}"
+        info.add_widget(_lbl(row2_txt, size=9, color=G2))
 
+        # Row 3: IP · Signal bars · last seen
+        bars = _signal_bars(sig)
+        bar_col = _signal_color(sig)
+        net_row = BoxLayout(size_hint_y=None, height=dp(16), spacing=dp(4))
+        net_row.add_widget(_lbl(f"IP: {ip}", size=9, color=G2))
+        net_row.add_widget(_lbl(bars, size=9, color=bar_col, bold=True))
+        info.add_widget(net_row)
+
+        # Row 4: ports / services (compact)
         if ports:
             info.add_widget(_lbl(
-                f"Open ports: {', '.join(ports)}",
-                size=9, color=YEL))
-        else:
-            info.add_widget(_lbl("Open ports: scanning...", size=9, color=G3))
-
-        if svcs:
+                f"Ports: {', '.join(str(p) for p in ports[:8])}",
+                size=8, color=YEL))
+        elif svcs:
             info.add_widget(_lbl(
-                f"Services: {', '.join(svcs[:6])}",
-                size=9, color=CYN))
+                f"Svc: {', '.join(svcs[:5])}",
+                size=8, color=CYN))
 
-        # ── button column ─────────────────────────────────────────────
+        # ── RIGHT: action buttons ─────────────────────────────────────
         btn_col = BoxLayout(orientation='vertical',
-                            size_hint_x=None, width=dp(80), spacing=dp(6))
+                            size_hint_x=None, width=dp(68),
+                            spacing=dp(5), padding=[dp(2), dp(8)])
 
-        btn_block = Button(
-            text="[UNBLOCK]" if blocked else "[BLOCK]",
-            font_size=sp(10),
-            color=YEL if blocked else RED,
-            background_color=(0, 0, 0, 0), background_normal='',
-            bold=True,
-        )
+        def _mk_btn(txt, col):
+            b = Button(text=txt, font_size=sp(9), color=col, bold=True,
+                       background_color=(0, 0, 0, 0), background_normal='',
+                       size_hint_y=None, height=dp(26))
+            with b.canvas.before:
+                Color(col[0], col[1], col[2], 0.12)
+                rb = RoundedRectangle(pos=b.pos, size=b.size, radius=[dp(4)])
+                b.bind(pos=lambda w, v: setattr(rb, 'pos', v),
+                       size=lambda w, v: setattr(rb, 'size', v))
+            return b
+
+        btn_block = _mk_btn(
+            "UNBLOCK" if blocked else "BLOCK",
+            YEL if blocked else RED)
         btn_block.bind(on_release=lambda *_: on_block(mac))
 
-        btn_trust = Button(
-            text="[UNTRUST]" if trusted else "[TRUST]",
-            font_size=sp(10),
-            color=G3 if trusted else G1,
-            background_color=(0, 0, 0, 0), background_normal='',
-            bold=True,
-        )
+        btn_trust = _mk_btn(
+            "UNTRUST" if trusted else "TRUST",
+            G3 if trusted else G1)
         if on_trust:
             btn_trust.bind(on_release=lambda *_: on_trust(mac))
 
@@ -2332,13 +3416,389 @@ class DeviceRow(BoxLayout):
         self.add_widget(info)
         self.add_widget(btn_col)
 
+        if on_tap:
+            self.bind(on_touch_down=self._check_tap)
+
+    def _check_tap(self, widget, touch):
+        if self.collide_point(*touch.pos) and self._on_tap:
+            self._on_tap(self._dev)
+            return True
+
+
+# ─── Device Detail Screen ────────────────────────────────────────────────────
+class DeviceDetailScreen(Screen):
+    """Full-screen detail panel opened when tapping a device card."""
+
+    def __init__(self, db, scanner_ref, ping_mon, sm_ref, **kwargs):
+        super().__init__(name='device_detail', **kwargs)
+        self.db       = db
+        self.scanner  = scanner_ref
+        self.ping_mon = ping_mon
+        self.sm       = sm_ref      # ScreenManager reference
+        self._dev     = None
+
+        root = BoxLayout(orientation='vertical', spacing=0, padding=0)
+        with root.canvas.before:
+            Color(*BG)
+            bg = Rectangle(pos=root.pos, size=root.size)
+            root.bind(pos=lambda w, v: setattr(bg, 'pos', v),
+                      size=lambda w, v: setattr(bg, 'size', v))
+
+        # ── top bar: back button + title ─────────────────────────────
+        top = BoxLayout(size_hint_y=None, height=dp(48),
+                        padding=[dp(6), dp(4)], spacing=dp(6))
+        with top.canvas.before:
+            Color(0, 0, 0, 0.6)
+            tb = Rectangle(pos=top.pos, size=top.size)
+            top.bind(pos=lambda w, v: setattr(tb, 'pos', v),
+                     size=lambda w, v: setattr(tb, 'size', v))
+        back = Button(text="[< BACK]", font_size=sp(11), color=G1, bold=True,
+                      background_color=(0, 0, 0, 0), background_normal='',
+                      size_hint_x=None, width=dp(80))
+        back.bind(on_release=lambda *_: self._go_back())
+        self._title = _lbl("Device Details", size=13, color=G1, bold=True,
+                           halign='center')
+        top.add_widget(back)
+        top.add_widget(self._title)
+        root.add_widget(top)
+
+        # ── scroll content ───────────────────────────────────────────
+        sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
+        self._inner = BoxLayout(orientation='vertical', size_hint_y=None,
+                                spacing=dp(8), padding=[dp(10), dp(8)])
+        self._inner.bind(minimum_height=self._inner.setter('height'))
+        sv.add_widget(self._inner)
+        root.add_widget(sv)
+
+        # ── status bar at bottom ─────────────────────────────────────
+        self._status = _lbl("", size=9, color=G2, halign='center')
+        sb = BoxLayout(size_hint_y=None, height=dp(24), padding=[dp(6), dp(2)])
+        sb.add_widget(self._status)
+        root.add_widget(sb)
+
+        self.add_widget(root)
+
+    def _go_back(self):
+        self.sm.transition.direction = 'right'
+        self.sm.current = 'devices'
+
+    def load(self, dev: dict):
+        self._dev = dev
+        self._inner.clear_widgets()
+        mac  = dev['mac']
+        ip   = dev.get('ip', 'Unknown')
+        name = dev.get('name', mac)
+        mfr  = dev.get('manufacturer', 'Unknown')
+        os_  = dev.get('os', 'Unknown')
+        sig  = dev.get('signal', '?')
+        dtype = dev.get('dtype', 'other')
+        blocked = self.db.is_blocked(mac)
+        trusted = self.db.is_trusted(mac)
+        ports   = dev.get('open_ports', [])
+        svcs    = dev.get('services', [])
+        logs    = dev.get('phone_log', [])
+
+        sym, sym_col, type_lbl = _brand_sym(mfr, dtype)
+        self._title.text = f"{sym}  {name}"
+
+        # ── HEADER CARD: icon + name + status ─────────────────────
+        hdr = BoxLayout(orientation='horizontal', size_hint_y=None,
+                        height=dp(100), padding=[dp(14), dp(10)],
+                        spacing=dp(12))
+        _card(hdr, radius=dp(8))
+
+        # left: big brand symbol
+        sym_col2 = BoxLayout(orientation='vertical', size_hint_x=None,
+                             width=dp(58))
+        sym_col2.add_widget(_lbl(sym, size=22, color=sym_col,
+                                 bold=True, halign='center'))
+        sym_col2.add_widget(_lbl(type_lbl, size=8, color=sym_col,
+                                 halign='center'))
+        hdr.add_widget(sym_col2)
+
+        # right: name block
+        info_col = BoxLayout(orientation='vertical', spacing=dp(3))
+
+        # online/offline badge
+        ping_online = (self.ping_mon.is_online(ip)
+                       if self.ping_mon else False)
+        status_txt = "● ONLINE NOW" if ping_online else "○ OFFLINE"
+        status_col = G1 if ping_online else G3
+        s_row = BoxLayout(size_hint_y=None, height=dp(18))
+        s_row.add_widget(_lbl(status_txt, size=9, color=status_col, bold=True))
+        if trusted:
+            s_row.add_widget(_lbl("[ TRUSTED ]", size=9, color=G1, bold=True,
+                                  halign='right'))
+        elif blocked:
+            s_row.add_widget(_lbl("[ BLOCKED ]", size=9, color=RED, bold=True,
+                                  halign='right'))
+        info_col.add_widget(s_row)
+
+        info_col.add_widget(_lbl(name, size=15, color=G1, bold=True))
+        model_str = dev.get('model', '')
+        detail_row2 = f"{mfr}  ·  {model_str}" if model_str else f"{mfr}  ·  {os_}"
+        info_col.add_widget(_lbl(detail_row2, size=10, color=G2))
+        if model_str:
+            info_col.add_widget(_lbl(os_, size=9, color=G3))
+        bars = _signal_bars(sig)
+        bar_col = _signal_color(sig)
+        info_col.add_widget(_lbl(f"{bars}  {sig} dBm", size=9, color=bar_col))
+        hdr.add_widget(info_col)
+        self._inner.add_widget(hdr)
+
+        # ── SECTION HELPER ────────────────────────────────────────
+        def _section(title, col=G1):
+            hb = BoxLayout(size_hint_y=None, height=dp(28),
+                           padding=[dp(4), dp(4), 0, 0])
+            hb.add_widget(_lbl(title, size=10, color=col, bold=True))
+            self._inner.add_widget(hb)
+
+        def _info_row(label, value, val_col=G1):
+            r = BoxLayout(orientation='horizontal', size_hint_y=None,
+                          height=dp(32), padding=[dp(12), dp(2)])
+            _card(r)
+            r.add_widget(_lbl(label, size=10, color=G3))
+            r.add_widget(_lbl(str(value), size=10, color=val_col,
+                               bold=True, halign='right'))
+            self._inner.add_widget(r)
+
+        # ── NETWORK INFO ──────────────────────────────────────────
+        _section("  NETWORK INFO")
+        _info_row("IP Address",     ip)
+        _info_row("MAC Address",    mac,  G2)
+        _info_row("Manufacturer",   mfr,  G1)
+        if dev.get('model'):
+            _info_row("Model",      dev['model'],  G1)
+        _info_row("OS / Platform",  os_,  G2)
+        _info_row("Signal (RSSI)",  f"{sig} dBm  {_signal_bars(sig)}",
+                  _signal_color(sig))
+        _info_row("First Seen",     str(dev.get('first_seen',''))[:19], G3)
+        _info_row("Last Seen",      str(dev.get('last_seen', ''))[:19], G2)
+        if dev.get('hostname') and dev['hostname'] != name:
+            _info_row("Hostname", dev['hostname'], G2)
+
+        # ── OPEN PORTS ────────────────────────────────────────────
+        if ports:
+            _section("  OPEN PORTS", YEL)
+            p_row = BoxLayout(size_hint_y=None, height=dp(36),
+                              padding=[dp(12), dp(4)], spacing=dp(6))
+            _card(p_row)
+            for p in ports[:14]:
+                pb = BoxLayout(size_hint_x=None, width=dp(40),
+                               size_hint_y=None, height=dp(28))
+                _card(pb, radius=dp(4))
+                pb.add_widget(_lbl(str(p), size=9, color=YEL,
+                                   bold=True, halign='center'))
+                p_row.add_widget(pb)
+            self._inner.add_widget(p_row)
+
+        # ── SERVICES ──────────────────────────────────────────────
+        if svcs:
+            _section("  DETECTED SERVICES", CYN)
+            s_row = BoxLayout(size_hint_y=None, height=dp(32),
+                              padding=[dp(12), dp(4)])
+            _card(s_row)
+            s_row.add_widget(_lbl("  ".join(svcs[:10]), size=9, color=CYN))
+            self._inner.add_widget(s_row)
+
+        # ── ACTION GRID ───────────────────────────────────────────
+        _section("  DEVICE MANAGEMENT")
+
+        def _action_btn(label, sub, col, cb):
+            """Rounded action button with label + subtitle."""
+            b = Button(
+                text=f"{label}\n{sub}",
+                font_size=sp(9), color=col, bold=True,
+                halign='center', valign='middle',
+                background_color=(0,0,0,0), background_normal='',
+                size_hint_y=None, height=dp(58))
+            b.bind(size=b.setter('text_size'))
+            with b.canvas.before:
+                Color(col[0], col[1], col[2], 0.15)
+                rb = RoundedRectangle(pos=b.pos, size=b.size, radius=[dp(10)])
+                Color(col[0], col[1], col[2], 0.40)
+                lb = Line(rounded_rectangle=(b.x, b.y, b.width, b.height, dp(10)),
+                          width=dp(1))
+                b.bind(
+                    pos=lambda w, v, r=rb, l=lb: [
+                        setattr(r, 'pos', v),
+                        setattr(l, 'rounded_rectangle',
+                                (v[0], v[1], w.width, w.height, dp(10)))],
+                    size=lambda w, v, r=rb, l=lb: [
+                        setattr(r, 'size', v),
+                        setattr(l, 'rounded_rectangle',
+                                (w.x, w.y, v[0], v[1], dp(10)))])
+            b.bind(on_release=cb)
+            return b
+
+        act_defs = [
+            ("BLOCK" if not blocked else "UNBLOCK",
+             "حجب الجهاز" if not blocked else "رفع الحجب",
+             RED if not blocked else YEL,
+             lambda *_: self._kick(mac, ip)),
+            ("PAUSE",
+             "إيقاف مؤقت",
+             (1.0, 0.5, 0.0, 1.0),
+             lambda *_: self._throttle(ip, 256)),
+            ("TRUST" if not trusted else "UNTRUST",
+             "موثوق" if not trusted else "إلغاء الثقة",
+             G1 if not trusted else G3,
+             lambda *_: self._toggle_trust(mac)),
+            ("PING",
+             "فحص الاتصال",
+             CYN,
+             lambda *_: self._ping(ip)),
+            ("PORT SCAN",
+             "فحص المنافذ",
+             YEL,
+             lambda *_: self._rescan(ip, mac)),
+            ("TRACEROUTE",
+             "تتبع المسار",
+             (0.80, 0.50, 1.00, 1.00),
+             lambda *_: self._traceroute(ip)),
+        ]
+
+        # 3 per row
+        for i in range(0, len(act_defs), 3):
+            row = BoxLayout(size_hint_y=None, height=dp(58),
+                            spacing=dp(6), padding=[dp(6), 0])
+            for lbl_t, sub, col, cb in act_defs[i:i+3]:
+                row.add_widget(_action_btn(lbl_t, sub, col, cb))
+            self._inner.add_widget(row)
+
+        # ── SPEED LIMIT ───────────────────────────────────────────
+        _section("  SPEED LIMIT")
+        spd_row = BoxLayout(size_hint_y=None, height=dp(44),
+                            spacing=dp(5), padding=[dp(6), dp(4)])
+        for lbl_t, kbps in [("256K","slow"), ("512K","med"),
+                             ("1 MB","fair"), ("5 MB","fast"), ("FREE","off")]:
+            b = _action_btn(lbl_t, kbps,
+                            G1 if kbps != "off" else G3,
+                            lambda *_, k=kbps, kb=kbps: None)
+            kbps_val = {"slow":256,"med":512,"fair":1024,"fast":5120,"off":0}
+            b.bind(on_release=lambda *_, k=lbl_t,
+                   kv=kbps_val.get(kbps,0): self._throttle(ip, kv))
+            b.height = dp(44)
+            spd_row.add_widget(b)
+        self._inner.add_widget(spd_row)
+
+        # ── RECENT ACTIVITY ───────────────────────────────────────
+        _section("  RECENT ACTIVITY", G2)
+        if not logs:
+            r = BoxLayout(size_hint_y=None, height=dp(30),
+                          padding=[dp(12), dp(4)])
+            _card(r)
+            r.add_widget(_lbl("No traffic captured yet.", size=9, color=G3))
+            self._inner.add_widget(r)
+        else:
+            for e in logs[:25]:
+                t     = e.get('time', '')
+                svc   = e.get('service', '?')
+                host  = e.get('hostname', e.get('remote', ''))
+                direc = ">>" if e.get('direction') == "OUT" else "<<"
+                r = BoxLayout(orientation='horizontal', size_hint_y=None,
+                              height=dp(22), padding=[dp(10), 0], spacing=dp(4))
+                _card(r)
+                r.add_widget(_lbl(f"{direc}", size=9, color=CYN,
+                                  size_hint_x=None, width=dp(20), bold=True))
+                r.add_widget(_lbl(svc, size=9, color=G1, bold=True,
+                                  size_hint_x=None, width=dp(80)))
+                r.add_widget(_lbl(host, size=8, color=G3))
+                r.add_widget(_lbl(t[-5:], size=8, color=G3,
+                                  size_hint_x=None, width=dp(36),
+                                  halign='right'))
+                self._inner.add_widget(r)
+
+        self._inner.add_widget(Widget(size_hint_y=None, height=dp(24)))
+
+    # ── Action helpers ───────────────────────────────────────────────
+    def _kick(self, mac, ip):
+        self.db.toggle_block(mac)
+        blocked = self.db.is_blocked(mac)
+        if blocked:
+            msg = self.scanner.kick_device(ip)
+        else:
+            msg = self.scanner.unkick_device(ip)
+        self._status.text = msg[:60]
+        self.load(self.db.get(mac) or self._dev)
+
+    def _toggle_trust(self, mac):
+        if self.db.is_trusted(mac):
+            self.db.untrust(mac)
+        else:
+            self.db.trust(mac)
+        self._status.text = "Trust updated."
+        self.load(self.db.get(mac) or self._dev)
+
+    def _ping(self, ip):
+        self._status.text = "Pinging…"
+        def _do():
+            ok = PingMonitor._ping_once(ip)
+            Clock.schedule_once(
+                lambda dt: setattr(self._status, 'text',
+                                   f"{'ONLINE' if ok else 'OFFLINE'}: {ip}"), 0)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _rescan(self, ip, mac):
+        self._status.text = "Port scanning…"
+        def _do():
+            self.scanner._port_scan(ip, mac)
+            dev = self.db.get(mac)
+            if dev:
+                Clock.schedule_once(lambda dt, d=dev: self.load(d), 0)
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _throttle(self, ip, kbps):
+        msg = self.scanner.throttle_device(ip, kbps)
+        self._status.text = msg[:60]
+
+    def _traceroute(self, ip):
+        self._status.text = f"Traceroute to {ip}…"
+        def _do():
+            import subprocess
+            try:
+                cmd = (["tracert", "-d", "-h", "15", ip]
+                       if os.name == "nt"
+                       else ["traceroute", "-n", "-m", "15", ip])
+                res = subprocess.run(cmd, capture_output=True,
+                                     text=True, timeout=20)
+                lines = (res.stdout or res.stderr or "No output").strip()
+                out   = "\n".join(lines.split("\n")[:18])
+            except Exception as ex:
+                out = str(ex)
+            Clock.schedule_once(
+                lambda dt: setattr(self._status, 'text',
+                                   out.replace("\n", "  ")[:80]), 0)
+        threading.Thread(target=_do, daemon=True).start()
+
 
 class DevicesScreen(BaseScreen):
     def __init__(self, db, **kwargs):
         super().__init__(db, name='devices', **kwargs)
+
+        # ── Status bar ────────────────────────────────────────────────
+        self._stat = _lbl("Scanning for phones…", size=10, color=G2,
+                          halign='center')
+        stat_row = BoxLayout(size_hint_y=None, height=dp(26),
+                             padding=[dp(8), dp(2)])
+        stat_row.add_widget(self._stat)
+
+        # ── Filter tabs: PHONES (default) | ALL | OTHER ──────────────
+        tab_row = BoxLayout(size_hint_y=None, height=dp(36),
+                            padding=[dp(6), dp(2)], spacing=dp(4))
+        self._filter = "phone"   # Default = phones only
+        for label, key in [("PHONES","phone"),("ALL","all"),("OTHER","other")]:
+            btn = Button(text=label, font_size=sp(9), bold=(key == "phone"),
+                         color=G1 if key == "phone" else G3,
+                         background_color=(0, 0, 0, 0), background_normal='')
+            btn.bind(on_release=lambda b, k=key: self._set_filter(k, tab_row))
+            tab_row.add_widget(btn)
+
         self.root_box.add_widget(
-            self._header("[ DEVICES ]",
-                         "All detected network devices"))
+            self._header("[ DEVICES ]", "All detected network devices"))
+        self.root_box.add_widget(stat_row)
+        self.root_box.add_widget(tab_row)
+
         sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         self._box = BoxLayout(orientation='vertical', size_hint_y=None,
                               spacing=dp(6), padding=[dp(8), dp(8)])
@@ -2346,17 +3806,71 @@ class DevicesScreen(BaseScreen):
         sv.add_widget(self._box)
         self.root_box.add_widget(sv)
 
+    def set_detail_screen(self, detail_screen):
+        """Called from app.build() once detail screen is ready."""
+        self._detail = detail_screen
+
+    def on_pre_enter(self, *args):
+        self.refresh()
+
+    def _open_detail(self, dev):
+        if hasattr(self, '_detail') and self._detail:
+            self._detail.load(dev)
+            self._detail.sm.transition.direction = 'left'
+            self._detail.sm.current = 'device_detail'
+
+    def _set_filter(self, key, tab_row):
+        self._filter = key
+        for btn in tab_row.children:
+            if isinstance(btn, Button):
+                active = (btn.text.lower() == key or
+                          (key == "phone" and btn.text == "PHONES") or
+                          (key == "all"   and btn.text == "ALL") or
+                          (key == "other" and btn.text == "OTHER"))
+                btn.bold  = active
+                btn.color = G1 if active else G3
+        self.refresh()
+
     def refresh(self):
         self._box.clear_widgets()
-        phones = [d for d in self.db.all() if _is_phone(d)]
-        phones.sort(key=lambda d: d.get('last_seen', ''), reverse=True)
-        if not phones:
+        all_devs = self.db.all()
+        all_devs.sort(key=lambda d: d.get('last_seen', ''), reverse=True)
+
+        # Apply filter
+        filt = self._filter if hasattr(self, '_filter') else "phone"
+        if filt == "phone":
+            devs = [d for d in all_devs if _is_phone(d)]
+        elif filt == "other":
+            devs = [d for d in all_devs if not _is_phone(d)]
+        else:
+            devs = all_devs   # ALL
+
+        phones   = [d for d in all_devs if _is_phone(d)]
+        cameras  = [d for d in all_devs if _is_camera(d)]
+        pcs      = [d for d in all_devs if _is_pc(d)]
+        total    = len(all_devs)
+        n_phone  = len(phones)
+
+        # Update status bar
+        scan_txt = (f"Phones: {n_phone}  |  Showing: {len(devs)}  "
+                    f"(All devices: {total})")
+        try:
+            self._stat.text = scan_txt
+            self._stat.color = G1 if n_phone > 0 else YEL
+        except Exception:
+            pass
+
+        if not devs:
             self._box.add_widget(
-                _lbl("No phones detected yet – scanning...",
+                _lbl("No phones detected yet – scanning…\n"
+                     "Make sure WiFi is on and Location permission is granted.",
                      size=11, color=G3, halign='center'))
-        for dev in phones:
+            return
+
+        for dev in devs:
             self._box.add_widget(
-                DeviceRow(dev, self.db, self._block, on_trust=self._trust))
+                DeviceRow(dev, self.db, self._block, on_trust=self._trust,
+                          on_tap=self._open_detail))
 
     def _block(self, mac):
         self.db.toggle_block(mac)
@@ -2380,11 +3894,12 @@ class LogScreen(BaseScreen):
           content cannot be read. Service name and metadata are shown.
     """
 
-    def __init__(self, db, **kwargs):
+    def __init__(self, db, scanner_ref=None, **kwargs):
         super().__init__(db, name='log', **kwargs)
+        self.scanner = scanner_ref
         self.root_box.add_widget(
             self._header("[ PHONE LOG ]",
-                         "Real-time traffic per phone  (metadata only for E2E apps)"))
+                         "DNS lookups + TCP traffic per device"))
 
         # encryption notice
         enc_bar = BoxLayout(size_hint_y=None, height=dp(28),
@@ -2409,78 +3924,200 @@ class LogScreen(BaseScreen):
 
     def _refresh(self, *_):
         self._box.clear_widgets()
-        phones = [d for d in self.db.all() if _is_phone(d)]
+        all_devs = self.db.all()
+        phones   = [d for d in all_devs if _is_phone(d)]
+        dns_log  = self.db._d.get("dns_log", [])
+
+        def _section_hdr(title, col=G1):
+            hb = BoxLayout(size_hint_y=None, height=dp(30),
+                           padding=[dp(8), dp(4)])
+            with hb.canvas.before:
+                Color(col[0], col[1], col[2], 0.08)
+                rb = RoundedRectangle(pos=hb.pos, size=hb.size, radius=[dp(4)])
+                hb.bind(pos=lambda w,v: setattr(rb,'pos',v),
+                        size=lambda w,v: setattr(rb,'size',v))
+            hb.add_widget(_lbl(title, size=10, color=col, bold=True))
+            self._box.add_widget(hb)
+
+        def _row(items, colors, widths):
+            """Generic horizontal row."""
+            r = BoxLayout(orientation='horizontal', size_hint_y=None,
+                          height=dp(22), padding=[dp(8), 0], spacing=dp(4))
+            for txt, col, w in zip(items, colors, widths):
+                kw = {} if w is None else {'size_hint_x': None, 'width': dp(w)}
+                r.add_widget(_lbl(txt, size=9, color=col, **kw))
+            self._box.add_widget(r)
+
+        # ═══════════════════════════════════════════════════════════
+        # 1. DNS LOG — websites visited by every device
+        # ═══════════════════════════════════════════════════════════
+        _section_hdr("  DNS LOG — WEBSITES VISITED", CYN)
+
+        if not dns_log:
+            proxy_port = getattr(self.scanner, '_dns_proxy_port', None)
+            if proxy_port:
+                tip = (f"DNS proxy running on port {proxy_port}.\n"
+                       "Set your router's DHCP DNS to this device's IP\n"
+                       "to capture ALL websites from ALL devices.")
+            else:
+                tip = ("Waiting for DNS queries…\n"
+                       "Tip: set this device as DNS server in router\n"
+                       "to capture websites from all devices.")
+            r = BoxLayout(orientation='vertical', size_hint_y=None,
+                          height=dp(60), padding=[dp(12), dp(4)])
+            _card(r)
+            r.add_widget(_lbl(tip, size=9, color=G3))
+            self._box.add_widget(r)
+        else:
+            # Group by source device, newest first
+            seen_domains: dict = {}   # src_ip → [domains]
+            for e in dns_log[:300]:
+                src = e.get('src', '?')
+                seen_domains.setdefault(src, [])
+                d = e.get('domain', '')
+                if d and d not in seen_domains[src]:
+                    seen_domains[src].append(d)
+
+            for src_ip, domains in seen_domains.items():
+                dev = self.db._find_by_ip(src_ip)
+                dev_name = (dev.get('name', src_ip) if dev else src_ip)
+                mfr  = (dev.get('manufacturer','?') if dev else '?')
+                sym, sym_col, _ = _brand_sym(mfr, dev.get('dtype','other') if dev else 'other')
+
+                # device sub-header
+                dh = BoxLayout(orientation='horizontal', size_hint_y=None,
+                               height=dp(28), padding=[dp(8), dp(3)], spacing=dp(6))
+                _card(dh)
+                dh.add_widget(_lbl(sym, size=10, color=sym_col, bold=True,
+                                   size_hint_x=None, width=dp(30)))
+                dh.add_widget(_lbl(f"{dev_name}  [{mfr}]  {src_ip}",
+                                   size=10, color=G1, bold=True))
+                dh.add_widget(_lbl(f"{len(domains)} domains", size=9,
+                                   color=G3, halign='right'))
+                self._box.add_widget(dh)
+
+                for domain in domains[:40]:
+                    svc = _domain_to_service(domain)
+                    r = BoxLayout(orientation='horizontal', size_hint_y=None,
+                                  height=dp(20), padding=[dp(16), 0], spacing=dp(6))
+                    r.add_widget(_lbl("→", size=9, color=CYN,
+                                      size_hint_x=None, width=dp(14), bold=True))
+                    r.add_widget(_lbl(svc, size=9, color=G1, bold=True,
+                                      size_hint_x=None, width=dp(90)))
+                    r.add_widget(_lbl(domain, size=8, color=G3))
+                    self._box.add_widget(r)
+
+        self._box.add_widget(Widget(size_hint_y=None, height=dp(6)))
+
+        # ═══════════════════════════════════════════════════════════
+        # 2. PER-PHONE DETAIL (sites + connections)
+        # ═══════════════════════════════════════════════════════════
+        _section_hdr("  PHONES — WEBSITES & CONNECTIONS", G1)
 
         if not phones:
-            self._box.add_widget(
-                _lbl("No phones detected yet.", size=11, color=G3,
-                     halign='center'))
-            return
+            r = BoxLayout(size_hint_y=None, height=dp(30), padding=[dp(10), dp(2)])
+            _card(r)
+            r.add_widget(_lbl("No phones detected yet – scanning…",
+                              size=9, color=G3))
+            self._box.add_widget(r)
+        else:
+            for dev in sorted(phones,
+                              key=lambda d: d.get('last_seen', ''), reverse=True):
+                self._add_phone_section(dev)
 
-        for dev in sorted(phones,
-                          key=lambda d: d.get('last_seen', ''), reverse=True):
-            self._add_phone_section(dev)
+        # ═══════════════════════════════════════════════════════════
+        # 3. SYSTEM EVENTS
+        # ═══════════════════════════════════════════════════════════
+        self._box.add_widget(Widget(size_hint_y=None, height=dp(6)))
+        sys_logs = self.db._d.get("log", [])[:30]
+        if sys_logs:
+            _section_hdr("  SYSTEM EVENTS", G2)
+            for e in sys_logs:
+                lvl = e.get('level', 'INFO')
+                col = RED if lvl == "ALERT" else (YEL if lvl == "WARN" else G3)
+                _row([f"[{e.get('time','')}]", e.get('msg','')],
+                     [col, G2], [56, None])
+
+        self._box.add_widget(Widget(size_hint_y=None, height=dp(20)))
 
     def _add_phone_section(self, dev):
-        mac  = dev['mac']
-        mfr  = dev.get('manufacturer', '?')
-        os_  = dev.get('os', '?')
-        ip   = dev.get('ip', '?')
-        name = dev.get('name', mac)
-        logs = dev.get('phone_log', [])
+        mac     = dev['mac']
+        mfr     = dev.get('manufacturer', '?')
+        os_     = dev.get('os', '?')
+        ip      = dev.get('ip', '?')
+        name    = dev.get('name', mac)
+        visits  = dev.get('dns_visits', [])   # domain list from DNS
+        logs    = dev.get('phone_log',  [])   # TCP traffic events
+        sym, sym_col, _ = _brand_sym(mfr, dev.get('dtype','phone'))
 
-        # ── phone header ──────────────────────────────────────────────
-        hdr = BoxLayout(size_hint_y=None, height=dp(40),
-                        padding=[dp(8), dp(4)])
+        # ── phone header card ─────────────────────────────────────────
+        hdr = BoxLayout(orientation='horizontal', size_hint_y=None,
+                        height=dp(46), padding=[dp(8), dp(6)],
+                        spacing=dp(8))
         _card(hdr)
-        sym = "[A]" if mfr == "Apple" else "[D]"
-        hdr.add_widget(_lbl(
-            f"{sym}  {name}  |  {mfr}  {os_}  |  IP: {ip}  |  MAC: {mac}",
-            size=11, color=WHT if mfr == "Apple" else G1, bold=True))
+        hdr.add_widget(_lbl(sym, size=14, color=sym_col, bold=True,
+                            size_hint_x=None, width=dp(36)))
+        info_col = BoxLayout(orientation='vertical')
+        info_col.add_widget(_lbl(name, size=12, color=G1, bold=True))
+        info_col.add_widget(_lbl(f"{mfr}  ·  {os_}  ·  {ip}",
+                                 size=8, color=G3))
+        hdr.add_widget(info_col)
+        n_sites = len(visits)
+        n_conn  = len(logs)
+        hdr.add_widget(_lbl(f"{n_sites} sites\n{n_conn} conn",
+                            size=8, color=CYN, halign='right',
+                            size_hint_x=None, width=dp(52)))
         self._box.add_widget(hdr)
 
-        if not logs:
-            row = BoxLayout(size_hint_y=None, height=dp(22),
-                            padding=[dp(12), 0])
-            row.add_widget(
-                _lbl("No traffic captured yet.", size=9, color=G3))
-            self._box.add_widget(row)
-            return
+        # ── WEBSITES VISITED (DNS) — primary ─────────────────────────
+        if visits:
+            sites_row = BoxLayout(orientation='vertical',
+                                  size_hint_y=None, padding=[dp(10), dp(4)],
+                                  spacing=dp(1))
+            sites_row.bind(minimum_height=sites_row.setter('height'))
+            for domain in visits[:60]:
+                svc = _domain_to_service(domain)
+                r = BoxLayout(orientation='horizontal', size_hint_y=None,
+                              height=dp(20), spacing=dp(6))
+                r.add_widget(_lbl("→", size=9, color=CYN, bold=True,
+                                  size_hint_x=None, width=dp(14)))
+                r.add_widget(_lbl(svc, size=9, color=G1, bold=True,
+                                  size_hint_x=None, width=dp(88)))
+                r.add_widget(_lbl(domain, size=8, color=G3))
+                sites_row.add_widget(r)
+            self._box.add_widget(sites_row)
+        else:
+            r = BoxLayout(size_hint_y=None, height=dp(20),
+                          padding=[dp(14), 0])
+            r.add_widget(_lbl("No DNS activity captured yet…",
+                              size=9, color=G3))
+            self._box.add_widget(r)
 
-        # ── traffic rows ──────────────────────────────────────────────
-        for e in logs[:50]:
-            direction = e.get('direction', 'OUT')
-            svc       = e.get('service', '?')
-            detail    = e.get('detail', '')
-            hostname  = e.get('hostname', e.get('remote', '?'))
-            port      = e.get('port', 0)
-            t         = e.get('time', '')
+        # ── TCP CONNECTIONS (compact) ─────────────────────────────────
+        tcp_events = [e for e in logs if e.get('port', 0) != 53][:20]
+        if tcp_events:
+            sub = BoxLayout(size_hint_y=None, height=dp(18),
+                            padding=[dp(10), 0])
+            sub.add_widget(_lbl("TCP CONNECTIONS:", size=8,
+                                color=G2, bold=True))
+            self._box.add_widget(sub)
+            for e in tcp_events:
+                t     = e.get('time', '')
+                svc   = e.get('service', '?')
+                host  = e.get('hostname', e.get('remote', ''))
+                direc = ">>" if e.get('direction') == "OUT" else "<<"
+                r = BoxLayout(orientation='horizontal', size_hint_y=None,
+                              height=dp(18), padding=[dp(14), 0], spacing=dp(4))
+                r.add_widget(_lbl(t[-5:], size=7, color=G3,
+                                  size_hint_x=None, width=dp(32)))
+                r.add_widget(_lbl(direc, size=8, color=CYN, bold=True,
+                                  size_hint_x=None, width=dp(16)))
+                r.add_widget(_lbl(svc, size=8, color=G1, bold=True,
+                                  size_hint_x=None, width=dp(80)))
+                r.add_widget(_lbl(host, size=7, color=G3))
+                self._box.add_widget(r)
 
-            dir_sym = ">>" if direction == "OUT" else "<<"
-            dir_col = CYN  if direction == "OUT" else YEL
-            is_interesting = svc not in ("HTTPS", "HTTP", ":443", ":80")
-
-            row = BoxLayout(orientation='horizontal', size_hint_y=None,
-                            height=dp(20), padding=[dp(12), 0], spacing=dp(4))
-
-            row.add_widget(_lbl(f"[{t}] {dir_sym}", size=8,
-                                color=dir_col, halign='left'))
-            row.add_widget(_lbl(
-                svc, size=9,
-                color=G1 if is_interesting else G2,
-                bold=is_interesting, halign='left'))
-            # show real domain name
-            domain_display = hostname if hostname != e.get('remote','') else f":{port}"
-            row.add_widget(_lbl(
-                f"{domain_display}  {detail}",
-                size=8, color=YEL if is_interesting else G3,
-                halign='left'))
-
-            self._box.add_widget(row)
-
-        # separator
-        sep = BoxLayout(size_hint_y=None, height=dp(8))
-        self._box.add_widget(sep)
+        self._box.add_widget(Widget(size_hint_y=None, height=dp(10)))
 
     def push(self, events):
         """Called when new traffic arrives."""
@@ -2858,8 +4495,44 @@ class SettingsScreen(BaseScreen):
     def __init__(self, db, **kwargs):
         super().__init__(db, name='settings', **kwargs)
         self.root_box.add_widget(
-            self._header("[ SETTINGS ]", "Scan / Privacy / Alerts / Speed Test"))
+            self._header("[ SETTINGS ]", "Network / Scan / Privacy / Speed Test"))
         self._speed = SpeedTest()
+
+        # ── Persistent network info bar – 2 rows, always visible ─────────
+        self._net_bar = BoxLayout(
+            orientation='vertical', size_hint_y=None, height=dp(68),
+            padding=[dp(10), dp(4)], spacing=dp(3)
+        )
+        with self._net_bar.canvas.before:
+            Color(0.0, 0.18, 0.0, 1.0)
+            _nb_bg = Rectangle(pos=self._net_bar.pos, size=self._net_bar.size)
+            # border line at bottom
+            Color(*G1, 0.35)
+            _nb_ln = Line(points=[0, 0, 1, 0], width=dp(0.7))
+            def _upd_nb(w, v, bg=_nb_bg, ln=_nb_ln):
+                bg.pos  = v if isinstance(v, (list, tuple)) and len(v) == 2 else w.pos
+                bg.size = w.size
+                ln.points = [w.x, w.y, w.x + w.width, w.y]
+            self._net_bar.bind(pos=_upd_nb, size=_upd_nb)
+
+        # Row 1: SSID | ISP
+        _row1 = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(28))
+        self._lbl_ssid = _lbl("SSID: ...", size=11, color=G1, bold=True)
+        self._lbl_isp  = _lbl("ISP: ...",  size=11, color=CYN, halign='right')
+        _row1.add_widget(self._lbl_ssid)
+        _row1.add_widget(self._lbl_isp)
+
+        # Row 2: IP | Password
+        _row2 = BoxLayout(orientation='horizontal', size_hint_y=None, height=dp(24))
+        self._lbl_ip   = _lbl("IP: ...",       size=10, color=G2)
+        self._lbl_pw   = _lbl("Pass: ...",     size=10, color=YEL, halign='right')
+        _row2.add_widget(self._lbl_ip)
+        _row2.add_widget(self._lbl_pw)
+
+        self._net_bar.add_widget(_row1)
+        self._net_bar.add_widget(_row2)
+        self.root_box.add_widget(self._net_bar)
+
         sv = ScrollView(size_hint=(1, 1), do_scroll_x=False)
         self._inner = BoxLayout(orientation='vertical', size_hint_y=None,
                                 spacing=dp(10), padding=[dp(12), dp(10)])
@@ -2867,6 +4540,10 @@ class SettingsScreen(BaseScreen):
         sv.add_widget(self._inner)
         self.root_box.add_widget(sv)
         self._build()
+
+    def on_pre_enter(self, *args):
+        """Reload network info bar every time settings screen is opened."""
+        threading.Thread(target=self._load_net_info, daemon=True).start()
 
     # ── helpers ───────────────────────────────────────────────────────
     def _section(self, title):
@@ -3095,6 +4772,16 @@ class SettingsScreen(BaseScreen):
                     self._net_rows["Gateway (Router)"].text = gw
                 if "ISP" in self._net_rows:
                     self._net_rows["ISP"].text = isp or "Unknown"
+                # Update persistent top bar
+                self._lbl_ssid.text = f"  SSID: {ssid or 'Unknown'}"
+                self._lbl_isp.text  = f"ISP: {isp or 'Unknown'}"
+                self._lbl_ip.text   = f"  IP: {my_ip}   GW: {gw}"
+                # Password: show clearly or explain why not available
+                pw_show = pw if pw and pw not in ("Root required", "", "Unknown") \
+                          else ("Root required" if ANDROID else "Not found")
+                self._lbl_pw.text  = f"Pass: {pw_show}"
+                self._lbl_pw.color = YEL if pw_show.startswith("Root") \
+                                     else (G1 if pw_show != "Not found" else RED)
             except Exception:
                 pass
 
@@ -3280,13 +4967,18 @@ class NexusVisionApp(App):
         self.sm  = ScreenManager(transition=FadeTransition(duration=0.12))
         self.rdr = RadarScreen(self.db)
         self.dev = DevicesScreen(self.db)
-        self.lg  = LogScreen(self.db)
+        self.lg  = LogScreen(self.db, scanner_ref=self.scanner)
         self.acc = AccessScreen(self.db, self.scanner,
                                 ping_monitor=self.ping_mon)
         self.cfg = SettingsScreen(self.db)
+        self.detail = DeviceDetailScreen(self.db, self.scanner,
+                                         self.ping_mon, self.sm)
 
-        for s in [self.rdr, self.dev, self.lg, self.acc, self.cfg]:
+        for s in [self.rdr, self.dev, self.lg, self.acc, self.cfg, self.detail]:
             self.sm.add_widget(s)
+
+        # Link detail screen to devices screen
+        self.dev.set_detail_screen(self.detail)
 
         root = BoxLayout(orientation='vertical', spacing=0, padding=0)
         root.add_widget(self.sm)
